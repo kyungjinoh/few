@@ -257,18 +257,14 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
           .then(buffer => {
             audioBuffer.current = buffer || null;
           })
-          .catch(error => {
-            console.log('Audio preload failed:', error);
-          });
+          .catch(() => {});
       } catch (error) {
-        console.log('Web Audio API initialization failed:', error);
+        // ignore initialization errors
       }
     }
 
     // Stop all audio immediately when browser is exited (mobile/tablet)
     const stopAllAudioImmediately = () => {
-      console.log('🔊 [CLICK SOUNDS] Stopping immediately due to browser exit');
-      
       // Stop Web Audio context
       if (audioContext.current) {
         audioContext.current.suspend();
@@ -372,18 +368,16 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
           soundQueue.current = Math.max(0, soundQueue.current - 1);
         }, 200);
       }
-    } else {
-      // Fallback for non-iOS or if Web Audio fails
-      try {
-        const audio = new Audio('/icons/popcat.mp3');
-        audio.volume = 0.3;
-        audio.play().catch(error => {
-          console.log('Audio play failed:', error);
-        });
-      } catch (error) {
-        console.log('Audio creation failed:', error);
-      }
+  } else {
+    // Fallback for non-iOS or if Web Audio fails
+    try {
+      const audio = new Audio('/icons/popcat.mp3');
+      audio.volume = 0.3;
+      audio.play().catch(() => {});
+    } catch (_error) {
+      // ignore audio creation failure
     }
+  }
   };
 
   // Create floating number effect
@@ -1922,8 +1916,6 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
   const handleSchoolLogoInteraction = (event: React.MouseEvent | React.TouchEvent) => {
     const now = Date.now();
     // Debug log to track event types
-    console.log(`🎯 [DEBUG] Event type: ${event.type}, isProcessingTouch: ${isProcessingTouch.current}, isIOS: ${isIOS.current}, time since last touch: ${now - lastTouchTime.current}ms`);
-    
     // Only prevent default for mouse events, not touch events (to avoid passive listener errors)
     if (event.type.startsWith('mouse')) {
       event.preventDefault();
@@ -1931,19 +1923,16 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
     
     // Prevent duplicate events on iOS (both mouse and touch events fire)
     if (now - lastInteractionTime.current < 100) { // Increased throttle to 100ms
-      console.log(`⏰ [DEBUG] Throttled - too soon: ${now - lastInteractionTime.current}ms`);
       return;
     }
     lastInteractionTime.current = now;
     
     // Additional check: if this is a mouse event but we're processing touch, skip it
     if (event.type.startsWith('mouse') && (isProcessingTouch.current || (now - lastTouchTime.current) < 500)) {
-      console.log(`🚫 [DEBUG] Skipping mouse event during touch processing`);
       return;
     }
     
     // Use immediate score update for all devices to test if batching is the issue
-    console.log(`📊 [DEBUG] Immediate score update - adding ${multiplier} points`);
     setScore(prev => {
       const newScore = prev + multiplier;
       saveIndividualScore(newScore);
@@ -1995,12 +1984,10 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
 
   const handleLogoMouseDown = useCallback((event: React.MouseEvent) => {
     const now = Date.now();
-    console.log(`🖱️ [DEBUG] Mouse down - isIOS: ${isIOS.current}, isProcessingTouch: ${isProcessingTouch.current}, time since last touch: ${now - lastTouchTime.current}ms`);
     
     // Skip mouse events only if we're processing touch OR if touch happened recently
     // Don't block all touch devices - laptops with touch screens should still work
     if (isProcessingTouch.current || (now - lastTouchTime.current) < 500) {
-      console.log(`🖱️ [DEBUG] Skipping mouse event - processing touch or recent touch`);
       return;
     }
     
@@ -2022,13 +2009,11 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
 
   const handleLogoTouchStart = useCallback((event: React.TouchEvent) => {
     const now = Date.now();
-    console.log(`👆 [DEBUG] Touch start - isIOS: ${isIOS.current}, time since last touch: ${now - lastTouchTime.current}ms`);
     
     // Don't use preventDefault in touch events to avoid passive listener errors
     setIsLogoPressed(true);
     
     // Always set touch processing flag for touch events (works for all touch devices)
-    console.log(`👆 [DEBUG] Setting isProcessingTouch = true for touch event`);
     isProcessingTouch.current = true;
     lastTouchTime.current = now;
     
@@ -2039,7 +2024,6 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
     
     // Reset touch processing flag after a short delay (works for all touch devices)
     setTimeout(() => {
-      console.log(`👆 [DEBUG] Touch processing timeout - setting isProcessingTouch = false`);
       isProcessingTouch.current = false;
     }, 300); // Increased timeout to be more reliable
   }, [handleSchoolLogoInteraction, playPopcatSound]);

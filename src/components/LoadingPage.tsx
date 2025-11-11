@@ -22,9 +22,6 @@ export const LoadingPage: React.FC<LoadingPageProps> = ({ onFirebaseLoaded }) =>
           
           // Store the school data in localStorage for static use
           localStorage.setItem('staticSchoolData', JSON.stringify(schools));
-          console.log('💾 [LOADING PAGE] Stored school data in localStorage:', schools.length, 'schools');
-        } else {
-          console.log('📋 [LOADING PAGE] Using existing cached data, no new storage needed');
         }
         
         onFirebaseLoaded?.();

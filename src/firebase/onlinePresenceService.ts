@@ -43,14 +43,8 @@ class OnlinePresenceService {
         return;
       }
       
-      // Reduced logging for production
-      if (import.meta.env.DEV) {
-        console.log('📍 Initializing presence for school:', schoolSlug);
-      }
-
       // Don't reinitialize if already on the same school
       if (this.currentSchool === schoolSlug && this.userRef) {
-        console.log(`✅ User already present in school: ${schoolSlug} - skipping initialization`);
         return;
       }
 
@@ -81,10 +75,6 @@ class OnlinePresenceService {
       // Remove the user when they disconnect
       await onDisconnect(this.userRef).remove();
 
-      if (import.meta.env.DEV) {
-        console.log(`✅ Online presence initialized for school: ${schoolSlug}`);
-      }
-      
     } catch (error) {
       console.error('❌ Error initializing presence:', error);
       console.warn('💡 Make sure Firebase Realtime Database is enabled in Firebase Console');

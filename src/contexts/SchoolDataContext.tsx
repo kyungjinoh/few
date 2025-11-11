@@ -25,7 +25,6 @@ export const SchoolDataProvider: React.FC<SchoolDataProviderProps> = ({ children
       const cachedData = localStorage.getItem('staticSchoolData');
       if (cachedData) {
         const parsedSchools = JSON.parse(cachedData);
-        console.log('📊 [SCHOOL DATA CONTEXT] Using cached school data:', parsedSchools.length, 'schools');
         setSchools(parsedSchools);
         setLoading(false);
         setError(null);
@@ -33,7 +32,6 @@ export const SchoolDataProvider: React.FC<SchoolDataProviderProps> = ({ children
       }
 
       // If no cached data, wait for LoadingPage to populate it
-      console.log('⚠️ [SCHOOL DATA CONTEXT] No cached data found - LoadingPage should have populated this');
       setError('School data not loaded properly from LoadingPage');
       setLoading(false);
     } catch (err) {
@@ -44,7 +42,6 @@ export const SchoolDataProvider: React.FC<SchoolDataProviderProps> = ({ children
   };
 
   const refreshData = async () => {
-    console.log('🔄 [SCHOOL DATA CONTEXT] Clearing cached data - LoadingPage will repopulate');
     // Clear cached data - user will need to refresh page to reload from LoadingPage
     localStorage.removeItem('staticSchoolData');
     setSchools([]);
@@ -53,7 +50,6 @@ export const SchoolDataProvider: React.FC<SchoolDataProviderProps> = ({ children
   };
 
   useEffect(() => {
-    console.log('🔄 [SCHOOL DATA CONTEXT] Loading static school data from localStorage or Firebase');
     loadStaticSchoolData();
   }, []);
 

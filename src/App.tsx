@@ -17,8 +17,6 @@ function App() {
     // Force default to muted (true) - clear any existing localStorage value
     localStorage.removeItem('isMuted');
     localStorage.setItem('isMuted', 'true');
-    
-    console.log('🔊 [MUTE STATE] Forced to muted (true) - cleared existing localStorage');
     return true;
   });
 
@@ -41,7 +39,6 @@ function App() {
         }
       }
       keysToRemove.forEach(key => localStorage.removeItem(key));
-      console.log('🧹 [APP] Cleared school cache:', keysToRemove.length, 'keys');
     };
 
     // Check for score reset scenario and clear all school scores
@@ -50,11 +47,9 @@ function App() {
         .some(key => key && key.startsWith('schoolScore_') && parseInt(localStorage.getItem(key) || '0') > 0);
       
       if (hasOldScores) {
-        console.log('🔄 [APP] Detected old scores in localStorage - clearing all school scores');
         const scoreKeys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i))
           .filter(key => key && key.startsWith('schoolScore_'));
         scoreKeys.forEach(key => key && localStorage.removeItem(key));
-        console.log('✅ [APP] Cleared', scoreKeys.length, 'old school scores');
       }
     };
 
@@ -94,12 +89,9 @@ function App() {
       music.volume = 0.3; // Set volume to 30%
       music.muted = true; // Always start muted
       setBackgroundMusic(music);
-      
-      console.log('🔊 [BACKGROUND MUSIC] Created with muted=true');
-      
+
       // Immediate music stopping for mobile/tablet when browser is exited
       const stopMusicImmediately = () => {
-        console.log('🔊 [BACKGROUND MUSIC] Stopping immediately due to browser exit');
         music.pause();
         music.currentTime = 0;
       };
@@ -149,8 +141,8 @@ function App() {
       try {
         await backgroundMusic.play();
         setMusicStarted(true);
-      } catch (error) {
-        console.log('Failed to start background music:', error);
+      } catch (_error) {
+        // ignore play failures
       }
     }
   };
@@ -160,7 +152,6 @@ function App() {
     const newMuteState = !isMuted;
     setIsMuted(newMuteState);
     localStorage.setItem('isMuted', newMuteState.toString());
-    console.log('🔊 [MUTE TOGGLE] Changed to:', newMuteState);
   };
 
   if (isLoading || !firebaseLoaded) {

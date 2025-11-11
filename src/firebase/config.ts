@@ -44,8 +44,4 @@ export const db = getFirestore(app);
 export const realtimeDb = getDatabase(app);
 export const storage = getStorage(app);
 
-if (import.meta.env.DEV) {
-  console.log("🔧 Firebase Realtime Database initialized:", !!realtimeDb);
-}
-
 export default app;

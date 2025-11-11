@@ -43,20 +43,16 @@ export const populateSchoolNameCache = (schools: School[]): void => {
   schools.forEach(school => {
     schoolNameToIdCache.set(school.schoolName, school.id);
   });
-  console.log(`📋 [FIREBASE DEBUG] Populated school name cache with ${schoolNameToIdCache.size} schools`);
-  console.log(`🗂️ [FIREBASE DEBUG] Cache contents:`, Array.from(schoolNameToIdCache.entries()).slice(0, 5), '...');
 };
 
 // Get all schools ordered by score (descending)
 export const getAllSchools = async (): Promise<School[]> => {
   // Prevent multiple simultaneous calls (React.StrictMode protection)
   if (isLoadingSchools && schoolsPromise) {
-    console.log('🔄 [FIREBASE DEBUG] getAllSchools already in progress, returning existing promise');
     return schoolsPromise;
   }
 
   if (schoolNameToIdCache.size > 0) {
-    console.log('📋 [FIREBASE DEBUG] Schools already loaded from cache, skipping Firebase query (0 reads)');
     // Return cached data if available (convert cache back to School array)
     const cachedData = localStorage.getItem('staticSchoolData');
     if (cachedData) {
@@ -68,7 +64,6 @@ export const getAllSchools = async (): Promise<School[]> => {
 
   schoolsPromise = (async () => {
     try {
-      console.log('🔍 [FIREBASE DEBUG] Starting getAllSchools query...');
       const schoolsRef = collection(db, SCHOOLS_COLLECTION);
       const q = query(schoolsRef, orderBy('score', 'desc'));
 
@@ -77,9 +72,7 @@ export const getAllSchools = async (): Promise<School[]> => {
         setTimeout(() => reject(new Error('Firestore query timeout')), 10000);
       });
 
-      console.log('📡 [FIREBASE DEBUG] Executing getDocs query...');
       const querySnapshot = await Promise.race([getDocs(q), timeoutPromise]);
-      console.log(`📊 [FIREBASE DEBUG] Query completed. Documents returned: ${querySnapshot.size}`);
 
     const schools: School[] = [];
     let currentRank = 1;
@@ -100,7 +93,6 @@ export const getAllSchools = async (): Promise<School[]> => {
     // Populate the cache after loading schools
     populateSchoolNameCache(schools);
 
-      console.log(`✅ [FIREBASE DEBUG] getAllSchools completed successfully. Total schools: ${schools.length}`);
       return schools;
     } catch (error) {
       console.error('❌ [FIREBASE DEBUG] Error getting schools:', error);
@@ -247,9 +239,7 @@ export const updateSchoolScoreByName = async (schoolName: string, scoreChanges: 
   }
 
   try {
-    console.log(`📞 [FIREBASE DEBUG] Calling updateScore function for ${schoolName} (${schoolId}) with delta ${clampedDelta}`);
     await callUpdateScore(schoolId, clampedDelta);
-    console.log(`✅ [FIREBASE DEBUG] Cloud Function score update succeeded for ${schoolName}`);
   } catch (error) {
     console.error('❌ [FIREBASE DEBUG] Cloud Function score update failed:', error);
     throw error;
@@ -263,7 +253,6 @@ export const updateSchoolLogo = async (schoolId: string, newLogoUrl: string): Pr
     await updateDoc(schoolRef, {
       schoolLogo: newLogoUrl
     });
-    console.log(`Admin updated school logo for ${schoolId} to: ${newLogoUrl}`);
   } catch (error) {
     console.error('Error updating school logo:', error);
     throw error;
@@ -360,7 +349,6 @@ export const submitSchoolRequest = async (
       console.warn('Failed to update local cache with new school:', cacheError);
     }
 
-    console.log('✅ School created with ID via Cloud Function:', schoolId);
     return schoolId;
   } catch (error) {
     console.error('❌ Error submitting school request:', error);
