@@ -44,7 +44,7 @@ const sessionRateLimiter = new RateLimiterMemory({
 });
 
 const userAgentBurstLimiter = new RateLimiterMemory({
-  points: 15,
+  points: 10,
   duration: 60,
 });
 
