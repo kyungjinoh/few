@@ -1,0 +1,43 @@
+// Firebase Security Rules for School Clicker with School Bonuses
+// Add these rules to your Firebase Firestore Rules
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Existing rules for schools collection
+    match /schools/{document} {
+      allow read, write: if true;
+    }
+    
+    // Existing rules for activeUsers collection
+    match /activeUsers/{document} {
+      allow read, write: if true;
+    }
+    
+    // NEW: Rules for schoolBonuses collection
+    match /schoolBonuses/{schoolSlug} {
+      // Allow anyone to read school bonuses (for displaying enhanced counts)
+      allow read: if true;
+      
+      // Allow creation of new school bonuses (when a school is first accessed)
+      allow create: if true;
+      
+      // Optionally, restrict updates to prevent tampering
+      // You can make this more restrictive if needed
+      allow update: if false; // Prevents modification once created
+      
+      // Allow deletion only by admin (you can add admin auth logic here)
+      allow delete: if false; // Prevents deletion
+    }
+    
+    // Alternative more restrictive rules for schoolBonuses:
+    /*
+    match /schoolBonuses/{schoolSlug} {
+      allow read: if true;
+      allow create: if request.auth != null; // Only authenticated users can create
+      allow update, delete: if false; // No updates/deletes allowed
+    }
+    */
+  }
+}

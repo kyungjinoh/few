@@ -1,0 +1,17 @@
+{
+  "rules": {
+    "schoolOnlineUsers": {
+      "$schoolSlug": {
+        ".read": true,
+        ".write": true
+      }
+    },
+    "schoolChats": {
+      "$schoolSlug": {
+        ".read": true,
+        ".write": true,
+        ".indexOn": "timestamp"
+      }
+    }
+  }
+}

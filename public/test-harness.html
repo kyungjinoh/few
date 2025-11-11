@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cloud Function Test Harness</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+        margin: 0;
+        padding: 24px;
+        line-height: 1.5;
+      }
+      h1 {
+        margin-top: 0;
+        color: #facc15;
+      }
+      label {
+        display: block;
+        margin-bottom: 12px;
+      }
+      input,
+      button,
+      textarea {
+        font: inherit;
+      }
+      input {
+        width: 100%;
+        max-width: 320px;
+        padding: 8px;
+        margin-top: 4px;
+        border: 1px solid #334155;
+        border-radius: 6px;
+        background: #1e293b;
+        color: inherit;
+      }
+      button {
+        padding: 10px 16px;
+        margin-right: 12px;
+        margin-top: 12px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        background: #2563eb;
+        color: #fff;
+      }
+      button.danger {
+        background: #dc2626;
+      }
+      button.secondary {
+        background: #475569;
+      }
+      #log {
+        margin-top: 24px;
+        padding: 16px;
+        border-radius: 8px;
+        background: #1e293b;
+        border: 1px solid #334155;
+        max-height: 320px;
+        overflow-y: auto;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        font-size: 14px;
+      }
+      .log-entry {
+        border-bottom: 1px solid #334155;
+        padding: 8px 0;
+      }
+      .log-entry:last-child {
+        border-bottom: none;
+      }
+      .log-entry strong {
+        color: #38bdf8;
+      }
+      .section {
+        margin-top: 32px;
+      }
+      textarea {
+        width: 100%;
+        min-height: 160px;
+        border-radius: 8px;
+        border: 1px solid #334155;
+        background: #0f172a;
+        color: inherit;
+        padding: 12px;
+      }
+      code {
+        background: rgba(148, 163, 184, 0.2);
+        padding: 2px 6px;
+        border-radius: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Cloud Function Test Harness</h1>
+    <p>
+      This page helps you simulate friendly and hostile requests to the
+      <code>updateScore</code> callable Cloud Function. Use the controls below to
+      send valid/invalid deltas, spam requests, and inspect the responses your
+      backend returns.
+    </p>
+
+    <section class="section">
+      <h2>1. Target configuration</h2>
+      <label>
+        Cloud Function URL
+        <input id="functionUrl" type="text" value="https://us-central1-school-clicker-938c5.cloudfunctions.net/updateScore" />
+      </label>
+      <label>
+        School ID (document ID in Firestore)
+        <input id="schoolId" type="text" value="walterpaytoncollegepreparatoryhs" />
+      </label>
+      <label>
+        Delta
+        <input id="delta" type="number" value="10" />
+      </label>
+    </section>
+
+    <section class="section">
+      <h2>2. Send requests</h2>
+      <button id="sendValid">Send valid request</button>
+      <button id="sendInvalid" class="danger">Send invalid delta (+5000)</button>
+      <button id="sendNegative" class="danger">Send negative delta (-10)</button>
+      <button id="spam" class="secondary">Spam 10 rapid clicks</button>
+      <button id="clearLog" class="secondary">Clear log</button>
+    </section>
+
+    <section class="section">
+      <h2>3. Console attack snippets</h2>
+      <p>
+        Copy/paste the following snippets into DevTools to mimic real-world abuse.
+        The responses should mirror what you see via the buttons above.
+      </p>
+      <textarea readonly>
+// Direct fetch with custom delta
+(async () => {
+  const res = await fetch("https://us-central1-school-clicker-938c5.cloudfunctions.net/updateScore", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ data: { schoolId: "walterpaytoncollegepreparatoryhs", delta: 1234 } })
+  });
+  console.log(await res.json());
+})();
+
+// Rapid-fire requests
+(async () => {
+  const url = "https://us-central1-school-clicker-938c5.cloudfunctions.net/updateScore";
+  for (let i = 0; i < 10; i++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data: { schoolId: "walterpaytoncollegepreparatoryhs", delta: 5 } })
+    });
+    console.log(i, await res.json());
+  }
+})();
+      </textarea>
+    </section>
+
+    <section class="section">
+      <h2>4. Response log</h2>
+      <div id="log"></div>
+    </section>
+
+    <script>
+      const functionUrlInput = document.getElementById('functionUrl');
+      const schoolIdInput = document.getElementById('schoolId');
+      const deltaInput = document.getElementById('delta');
+      const logEl = document.getElementById('log');
+
+      const log = (label, payload) => {
+        const entry = document.createElement('div');
+        entry.className = 'log-entry';
+        const timestamp = new Date().toLocaleTimeString();
+        entry.innerHTML = `<strong>[${timestamp}] ${label}</strong><pre>${JSON.stringify(payload, null, 2)}</pre>`;
+        logEl.prepend(entry);
+      };
+
+      const callFunction = async (deltaOverride) => {
+        const url = functionUrlInput.value.trim();
+        const schoolId = schoolIdInput.value.trim();
+        const delta = deltaOverride ?? Number(deltaInput.value);
+
+        if (!url || !schoolId) {
+          alert('Please provide both function URL and school ID.');
+          return;
+        }
+
+        try {
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data: { schoolId, delta } }),
+            mode: 'cors',
+          });
+
+          const body = await res.json().catch(() => ({ raw: 'No JSON response' }));
+          log(`HTTP ${res.status}`, body);
+        } catch (error) {
+          log('Fetch error', { message: error.message });
+        }
+      };
+
+      document.getElementById('sendValid').onclick = () => callFunction();
+      document.getElementById('sendInvalid').onclick = () => callFunction(5000);
+      document.getElementById('sendNegative').onclick = () => callFunction(-10);
+      document.getElementById('spam').onclick = async () => {
+        for (let i = 0; i < 10; i++) {
+          await callFunction(5);
+        }
+      };
+      document.getElementById('clearLog').onclick = () => (logEl.innerHTML = '');
+    </script>
+  </body>
+</html>
