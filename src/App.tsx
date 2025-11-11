@@ -6,7 +6,6 @@ import { LeaderboardPage } from './components/LeaderboardPage';
 import { GamePage } from './components/GamePage';
 import { SchoolSupportPage } from './components/SchoolSupportPage';
 import { SchoolDataProvider } from './contexts/SchoolDataContext';
-import { useSingleTabGuard } from './hooks/useSingleTabGuard';
 import './index.css';
 
 function App() {
@@ -163,21 +162,6 @@ function App() {
     localStorage.setItem('isMuted', newMuteState.toString());
     console.log('🔊 [MUTE TOGGLE] Changed to:', newMuteState);
   };
-
-  const { isBlocked } = useSingleTabGuard();
-
-  if (isBlocked) {
-    return (
-      <div className="w-screen h-screen bg-black flex items-center justify-center">
-        <div className="text-center text-white px-6">
-          <h1 className="font-pixelify text-3xl md:text-4xl mb-4">Multiple Tabs Detected</h1>
-          <p className="text-base md:text-lg text-gray-300">
-            You already have School Clicker open in another tab. Please return to the original tab to continue playing.
-          </p>
-        </div>
-      </div>
-    );
-  }
 
   if (isLoading || !firebaseLoaded) {
     return <LoadingPage onFirebaseLoaded={() => setFirebaseLoaded(true)} />;
