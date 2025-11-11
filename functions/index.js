@@ -43,10 +43,17 @@ const sessionRateLimiter = new RateLimiterMemory({
   duration: 60,
 });
 
+const userAgentBurstLimiter = new RateLimiterMemory({
+  points: 15,
+  duration: 60,
+});
+
 const SESSION_COLLECTION = "clickerSessions";
+const USER_AGENT_BLOCKS_COLLECTION = "clickerUserAgentBlocks";
 const SESSION_TOKEN_BYTES = 32;
 const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
 const SESSION_BLOCK_DURATION_MS = 1000 * 60 * 15; // 15 minutes
+const USER_AGENT_BLOCK_DURATION_MS = 1000 * 60 * 60 * 24; // 24 hours
 const SESSION_FRICTION_THRESHOLD = 3;
 const CAPTCHA_PROVIDER_TURNSTILE = "turnstile";
 
@@ -82,6 +89,64 @@ const generateSessionToken = () => {
 
 const hashSessionToken = (token) => {
   return crypto.createHash("sha256").update(token).digest("hex");
+};
+
+const normalizeUserAgent = (userAgent) => {
+  if (typeof userAgent !== "string" || userAgent.length === 0) {
+    return "unknown";
+  }
+  return userAgent.trim().slice(0, 500).toLowerCase();
+};
+
+const getUserAgentBlockRef = (normalizedUa) => {
+  return firestore.collection(USER_AGENT_BLOCKS_COLLECTION).doc(normalizedUa);
+};
+
+const checkUserAgentBlock = async (normalizedUa) => {
+  const blockRef = getUserAgentBlockRef(normalizedUa);
+  const blockSnap = await blockRef.get();
+
+  if (!blockSnap.exists) {
+    return null;
+  }
+
+  const blockData = blockSnap.data() || {};
+  const expiresAt = blockData.expiresAt instanceof Timestamp ? blockData.expiresAt.toMillis() : null;
+
+  if (expiresAt && expiresAt > Date.now()) {
+    return {
+      blockedUntil: new Date(expiresAt).toISOString(),
+      reason: blockData.reason || "user-agent-rate-limit",
+    };
+  }
+
+  // Block expired; clean up.
+  blockRef.delete().catch((error) => {
+    logger.warn("Failed to delete expired user agent block", {
+      error: error.message,
+      userAgent: normalizedUa,
+    });
+  });
+  return null;
+};
+
+const blockUserAgent = async (normalizedUa, metadata = {}) => {
+  const blockRef = getUserAgentBlockRef(normalizedUa);
+  const expiresAt = Timestamp.fromMillis(Date.now() + USER_AGENT_BLOCK_DURATION_MS);
+
+  await blockRef.set({
+    reason: "user-agent-rate-limit",
+    createdAt: FieldValue.serverTimestamp(),
+    expiresAt,
+    metadata,
+  }, {merge: true}).catch((error) => {
+    logger.error("Failed to persist user agent block", {
+      error: error.message,
+      userAgent: normalizedUa,
+    });
+  });
+
+  return expiresAt.toDate().toISOString();
 };
 
 let turnstileSecret =
@@ -179,6 +244,20 @@ exports.createClickerSession = onCall({
   const providedUserAgent = typeof data.userAgent === "string" ? data.userAgent.slice(0, 500) : null;
 
   const {ip, userAgent: headerUserAgent} = getRequestContext(request.rawRequest);
+  const clientProvidedUserAgent = (clientContext &&
+    typeof clientContext === "object" &&
+    typeof clientContext.userAgent === "string")
+    ? clientContext.userAgent
+    : null;
+  const normalizedUserAgent = normalizeUserAgent(providedUserAgent || headerUserAgent);
+
+  const existingBlock = await checkUserAgentBlock(normalizedUserAgent);
+  if (existingBlock) {
+    throw new HttpsError("resource-exhausted", "User agent temporarily blocked due to excessive activity.", {
+      code: "USER_AGENT_BLOCKED",
+      blockedUntil: existingBlock.blockedUntil,
+    });
+  }
 
   try {
     await sessionCreationLimiter.consume(ip);
@@ -188,6 +267,26 @@ exports.createClickerSession = onCall({
       error: error.message,
     });
     throw new HttpsError("resource-exhausted", "Too many session requests — try again later.");
+  }
+
+  try {
+    await userAgentBurstLimiter.consume(normalizedUserAgent);
+  } catch (error) {
+    const blockedUntilIso = await blockUserAgent(normalizedUserAgent, {
+      ip,
+      error: error.message,
+    });
+
+    logger.warn("User agent burst limit exceeded; blocked for 24h", {
+      userAgent: normalizedUserAgent,
+      ip,
+      blockedUntil: blockedUntilIso,
+    });
+
+    throw new HttpsError("resource-exhausted", "User agent temporarily blocked due to excessive activity.", {
+      code: "USER_AGENT_BLOCKED",
+      blockedUntil: blockedUntilIso,
+    });
   }
 
   const sessionToken = generateSessionToken();
@@ -215,6 +314,7 @@ exports.createClickerSession = onCall({
   logger.info("Issued new clicker session", {
     sessionId: hashedToken,
     ip,
+    userAgent: normalizedUserAgent,
   });
 
   return {
@@ -362,6 +462,42 @@ exports.updateScore = onCall({
   }
 
   const sessionData = sessionSnap.data() || {};
+  const normalizedUserAgent = normalizeUserAgent(
+    clientProvidedUserAgent ||
+    sessionData.userAgent ||
+    headerUserAgent,
+  );
+
+  const userAgentBlock = await checkUserAgentBlock(normalizedUserAgent);
+  if (userAgentBlock) {
+    throw new HttpsError("resource-exhausted", "User agent temporarily blocked due to excessive activity.", {
+      code: "USER_AGENT_BLOCKED",
+      blockedUntil: userAgentBlock.blockedUntil,
+    });
+  }
+
+  try {
+    await userAgentBurstLimiter.consume(normalizedUserAgent);
+  } catch (error) {
+    const blockedUntilIso = await blockUserAgent(normalizedUserAgent, {
+      ip,
+      sessionId: hashedToken,
+      error: error.message,
+    });
+
+    logger.warn("User agent burst limit exceeded during updateScore; blocked for 24h", {
+      userAgent: normalizedUserAgent,
+      ip,
+      sessionId: hashedToken,
+      blockedUntil: blockedUntilIso,
+    });
+
+    throw new HttpsError("resource-exhausted", "User agent temporarily blocked due to excessive activity.", {
+      code: "USER_AGENT_BLOCKED",
+      blockedUntil: blockedUntilIso,
+    });
+  }
+
   let currentFrictionLevel = sessionData.frictionLevel || 0;
 
   const nowMs = Date.now();
@@ -482,11 +618,7 @@ exports.updateScore = onCall({
     score: FieldValue.increment(delta),
   });
 
-  const clientUserAgent = (
-    clientContext &&
-    typeof clientContext === "object" &&
-    typeof clientContext.userAgent === "string"
-  ) ? clientContext.userAgent.slice(0, 500) : null;
+  const clientUserAgent = clientProvidedUserAgent ? clientProvidedUserAgent.slice(0, 500) : null;
 
   const sessionUpdates = {
     lastUsedAt: FieldValue.serverTimestamp(),
