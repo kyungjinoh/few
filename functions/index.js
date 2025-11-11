@@ -134,11 +134,18 @@ const blockUserAgent = async (normalizedUa, metadata = {}) => {
   const blockRef = getUserAgentBlockRef(normalizedUa);
   const expiresAt = Timestamp.fromMillis(Date.now() + USER_AGENT_BLOCK_DURATION_MS);
 
+  const safeMetadata = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === "string" && value.trim().length === 0) continue;
+    safeMetadata[key] = value;
+  }
+
   await blockRef.set({
     reason: "user-agent-rate-limit",
     createdAt: FieldValue.serverTimestamp(),
     expiresAt,
-    metadata,
+    metadata: safeMetadata,
   }, {merge: true}).catch((error) => {
     logger.error("Failed to persist user agent block", {
       error: error.message,
