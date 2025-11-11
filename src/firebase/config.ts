@@ -1,35 +1,51 @@
-import { initializeApp, getApps } from 'firebase/app';
-import { getFirestore } from 'firebase/firestore';
-import { getDatabase } from 'firebase/database';
-import { getStorage } from 'firebase/storage';
+import { initializeApp, getApps } from "firebase/app";
+import { getFirestore } from "firebase/firestore";
+import { getDatabase } from "firebase/database";
+import { getStorage } from "firebase/storage";
 
-// Your Firebase configuration
+const requiredEnvVars = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  databaseURL: import.meta.env.VITE_FIREBASE_DATABASE_URL,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID,
+} as const;
+
+const missingKeys = Object.entries(requiredEnvVars)
+  .filter(([, value]) => typeof value !== "string" || value.length === 0)
+  .map(([key]) => key);
+
+if (missingKeys.length > 0) {
+  throw new Error(
+    `Missing Firebase environment variables: ${missingKeys.join(
+        ", ",
+    )}. Did you forget to configure your .env file?`,
+  );
+}
+
 const firebaseConfig = {
-  apiKey: "AIzaSyBro7XPwPZ2c0Aejoz9wNuPcnKTxWgQyOw",
-  authDomain: "school-clicker-938c5.firebaseapp.com",
-  databaseURL: "https://school-clicker-938c5-default-rtdb.firebaseio.com/",
-  projectId: "school-clicker-938c5",
-  storageBucket: "school-clicker-938c5.firebasestorage.app",
-  messagingSenderId: "813386795404",
-  appId: "1:813386795404:web:5aaba099581fd11a372ea9",
-  measurementId: "G-C687RHWZ53"
+  apiKey: requiredEnvVars.apiKey,
+  authDomain: requiredEnvVars.authDomain,
+  databaseURL: requiredEnvVars.databaseURL,
+  projectId: requiredEnvVars.projectId,
+  storageBucket: requiredEnvVars.storageBucket,
+  messagingSenderId: requiredEnvVars.messagingSenderId,
+  appId: requiredEnvVars.appId,
+  measurementId: requiredEnvVars.measurementId,
 };
 
-// Initialize Firebase only if it hasn't been initialized already
-export const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
+export const app =
+  getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
 
-// Initialize Firestore (for school data and persistent information)
 export const db = getFirestore(app);
-
-// Initialize Realtime Database (for online users only)
 export const realtimeDb = getDatabase(app);
-
-// Initialize Firebase Storage (for proof uploads)
 export const storage = getStorage(app);
 
-// Debug: Check if Realtime Database is properly initialized (development only)
 if (import.meta.env.DEV) {
-  console.log('🔧 Firebase Realtime Database initialized:', !!realtimeDb);
+  console.log("🔧 Firebase Realtime Database initialized:", !!realtimeDb);
 }
 
 export default app;

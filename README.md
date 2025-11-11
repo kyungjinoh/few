@@ -24,6 +24,7 @@ A mobile-first clicker game where players can attack or support different school
 - Progressive friction introduces CAPTCHA challenges and temporary session blocks once abuse thresholds are hit (Cloudflare Turnstile supported).
 - Configure a WAF (e.g., Cloudflare) in front of the deployment to filter malicious traffic before it reaches Firebase.
 - Set the `CLOUDFLARE_TURNSTILE_SECRET` environment variable (or `firebase functions:config:set turnstile.secret=...`) so the backend can validate CAPTCHA tokens.
+- Rotate Firebase API keys that have ever been public and keep the replacements in environment variables instead of committing them to source control.
 
 ## Getting Started
 
@@ -37,7 +38,8 @@ npm install
 npm run dev
 ```
 
-3. Open http://localhost:3000 in your browser
+3. Copy `env.example` to `.env` (or `.env.local`) and fill in your Firebase values.
+4. Open http://localhost:3000 in your browser
 
 ## Project Structure
 
