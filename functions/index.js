@@ -244,11 +244,6 @@ exports.createClickerSession = onCall({
   const providedUserAgent = typeof data.userAgent === "string" ? data.userAgent.slice(0, 500) : null;
 
   const {ip, userAgent: headerUserAgent} = getRequestContext(request.rawRequest);
-  const clientProvidedUserAgent = (clientContext &&
-    typeof clientContext === "object" &&
-    typeof clientContext.userAgent === "string")
-    ? clientContext.userAgent
-    : null;
   const normalizedUserAgent = normalizeUserAgent(providedUserAgent || headerUserAgent);
 
   const existingBlock = await checkUserAgentBlock(normalizedUserAgent);
@@ -462,10 +457,16 @@ exports.updateScore = onCall({
   }
 
   const sessionData = sessionSnap.data() || {};
+  const clientProvidedUserAgent =
+    clientContext &&
+    typeof clientContext === "object" &&
+    typeof clientContext.userAgent === "string"
+      ? clientContext.userAgent
+      : null;
   const normalizedUserAgent = normalizeUserAgent(
-    clientProvidedUserAgent ||
-    sessionData.userAgent ||
-    headerUserAgent,
+      clientProvidedUserAgent ||
+      sessionData.userAgent ||
+      headerUserAgent,
   );
 
   const userAgentBlock = await checkUserAgentBlock(normalizedUserAgent);
