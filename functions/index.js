@@ -13,9 +13,6 @@ const {RateLimiterMemory} = require("rate-limiter-flexible");
 const logger = require("firebase-functions/logger");
 const crypto = require("crypto");
 
-const hasGlobalFetch = typeof global === "object" && typeof global.fetch === "function";
-const fetchFn = hasGlobalFetch ? global.fetch.bind(global) : null;
-
 // Initialize Firebase Admin SDK
 initializeApp();
 
@@ -33,22 +30,9 @@ const addSchoolRateLimiter = new RateLimiterMemory({
   duration: 60 * 60, // 3 attempts per hour per IP
 });
 
-const sessionCreationLimiter = new RateLimiterMemory({
-  points: 5,
-  duration: 60,
-});
-
-const sessionRateLimiter = new RateLimiterMemory({
-  points: 20,
-  duration: 60,
-});
-
-const SESSION_COLLECTION = "clickerSessions";
 const SESSION_TOKEN_BYTES = 32;
-const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
-const SESSION_BLOCK_DURATION_MS = 1000 * 60 * 15; // 15 minutes
-const SESSION_FRICTION_THRESHOLD = 3;
-const CAPTCHA_PROVIDER_TURNSTILE = "turnstile";
+const SCHOOL_HOURLY_LIMIT = 100000;
+const SCHOOL_HOURLY_LIMIT_COLLECTION = "schoolHourlyLimits";
 
 const getRequestContext = (rawRequest) => {
   let ip = "unknown";
@@ -76,91 +60,6 @@ const getRequestContext = (rawRequest) => {
   return {ip, userAgent};
 };
 
-const generateSessionToken = () => {
-  return crypto.randomBytes(SESSION_TOKEN_BYTES).toString("hex");
-};
-
-const hashSessionToken = (token) => {
-  return crypto.createHash("sha256").update(token).digest("hex");
-};
-
-let turnstileSecret =
-  process.env.CLOUDFLARE_TURNSTILE_SECRET ||
-  process.env.TURNSTILE_SECRET ||
-  process.env.TURNSTILE_API_SECRET ||
-  null;
-
-try {
-  const config = require("firebase-functions").config();
-  if (
-    !turnstileSecret &&
-    config &&
-    typeof config === "object" &&
-    config.turnstile &&
-    config.turnstile.secret
-  ) {
-    turnstileSecret = config.turnstile.secret;
-  }
-} catch (error) {
-  // config() throws in local environments when not initialized; ignore.
-}
-
-const verifyTurnstileCaptcha = async (token, ip) => {
-  if (!token) {
-    return false;
-  }
-
-  if (!turnstileSecret) {
-    logger.warn("Turnstile secret is not configured; skipping CAPTCHA verification.");
-    // Allow the request to continue to prevent hard lockouts.
-    return true;
-  }
-
-  if (!fetchFn) {
-    logger.error("Fetch API not available in this environment — cannot verify CAPTCHA.");
-    return false;
-  }
-
-  try {
-    const response = await fetchFn("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        secret: turnstileSecret,
-        response: token,
-        remoteip: ip,
-      }),
-    });
-
-    if (!response.ok) {
-      logger.error("Failed to verify Turnstile CAPTCHA — non-OK response", {
-        status: response.status,
-        statusText: response.statusText,
-      });
-      return false;
-    }
-
-    const data = await response.json();
-    if (!data.success) {
-      logger.warn("Turnstile CAPTCHA verification failed", {
-        errorCodes: data["error-codes"] || [],
-      });
-    }
-    return !!data.success;
-  } catch (error) {
-    logger.error("Error verifying Turnstile CAPTCHA", {
-      error: error.message,
-    });
-    return false;
-  }
-};
-
-const getSessionDocRef = (hashedToken) => {
-  return firestore.collection(SESSION_COLLECTION).doc(hashedToken);
-};
-
 const generateSchoolId = (schoolName) => {
   return schoolName
       .toLowerCase()
@@ -175,54 +74,16 @@ exports.createClickerSession = onCall({
   memory: "256MiB",
   timeoutSeconds: 10,
 }, async (request) => {
-  const data = request.data || {};
-  const providedUserAgent = typeof data.userAgent === "string" ? data.userAgent.slice(0, 500) : null;
+  const {ip} = getRequestContext(request.rawRequest);
+  const sessionToken = crypto.randomBytes(SESSION_TOKEN_BYTES).toString("hex");
 
-  const {ip, userAgent: headerUserAgent} = getRequestContext(request.rawRequest);
-  const effectiveUserAgent = providedUserAgent || headerUserAgent || "unknown";
-
-  try {
-    await sessionCreationLimiter.consume(ip);
-  } catch (error) {
-    logger.warn("Session creation rate limit exceeded", {
-      ip,
-      error: error.message,
-    });
-    throw new HttpsError("resource-exhausted", "Too many session requests — try again later.");
-  }
-
-  const sessionToken = generateSessionToken();
-  const hashedToken = hashSessionToken(sessionToken);
-  const now = Date.now();
-  const expiresAtMs = now + SESSION_TTL_MS;
-
-  const sessionDoc = {
-    createdAt: FieldValue.serverTimestamp(),
-    lastUsedAt: FieldValue.serverTimestamp(),
-    expiresAt: Timestamp.fromMillis(expiresAtMs),
-    ipAddress: ip,
-    userAgent: effectiveUserAgent,
-    requestCount: 0,
-    rateLimitedAt: null,
-    frictionLevel: 0,
-    captchaProvider: CAPTCHA_PROVIDER_TURNSTILE,
-    blockedUntil: null,
-    lastCaptchaSolvedAt: null,
-    lastFrictionReason: null,
-  };
-
-  await getSessionDocRef(hashedToken).set(sessionDoc, {merge: true});
-
-  logger.info("Issued new clicker session", {
-    sessionId: hashedToken,
+  logger.debug("Issued clicker session token", {
     ip,
-    userAgent: effectiveUserAgent,
   });
 
   return {
     sessionToken,
-    expiresAt: new Date(expiresAtMs).toISOString(),
-    captchaProvider: CAPTCHA_PROVIDER_TURNSTILE,
+    expiresAt: null,
   };
 });
 
@@ -315,13 +176,7 @@ exports.updateScore = onCall({
   timeoutSeconds: 10,
 }, async (request) => {
   const data = request.data || {};
-  const {
-    schoolId,
-    delta,
-    sessionToken,
-    captchaToken,
-    clientContext,
-  } = data;
+  const {schoolId, delta} = data;
 
   const deltaErrorMessage = "Invalid delta — only values between 0 and +500 are allowed.";
 
@@ -339,11 +194,7 @@ exports.updateScore = onCall({
     throw new HttpsError("invalid-argument", deltaErrorMessage);
   }
 
-  if (typeof sessionToken !== "string" || sessionToken.length < SESSION_TOKEN_BYTES) {
-    throw new HttpsError("unauthenticated", "Missing or invalid session token.");
-  }
-
-  const {ip, userAgent: headerUserAgent} = getRequestContext(request.rawRequest);
+  const {ip} = getRequestContext(request.rawRequest);
 
   try {
     await rateLimiter.consume(ip);
@@ -355,178 +206,85 @@ exports.updateScore = onCall({
     throw new HttpsError("resource-exhausted", "Too many requests from this IP — slow down.");
   }
 
-  const hashedToken = hashSessionToken(sessionToken);
-  const sessionRef = getSessionDocRef(hashedToken);
-  const sessionSnap = await sessionRef.get();
-
-  if (!sessionSnap.exists) {
-    throw new HttpsError("unauthenticated", "Session expired or invalid. Refresh and try again.");
-  }
-
-  const sessionData = sessionSnap.data() || {};
-  let clientProvidedUserAgent = null;
-  if (
-    clientContext &&
-    typeof clientContext === "object" &&
-    typeof clientContext.userAgent === "string"
-  ) {
-    clientProvidedUserAgent = clientContext.userAgent;
-  }
-
-  let currentFrictionLevel = sessionData.frictionLevel || 0;
-
-  const nowMs = Date.now();
-
-  if (sessionData.expiresAt instanceof Timestamp && sessionData.expiresAt.toMillis() < nowMs) {
-    await sessionRef.delete().catch((error) => {
-      logger.warn("Failed to delete expired session", {
-        error: error.message,
-        sessionId: hashedToken,
-      });
-    });
-    throw new HttpsError("unauthenticated", "Session expired. Start a new session to continue.");
-  }
-
-  if (sessionData.blockedUntil instanceof Timestamp && sessionData.blockedUntil.toMillis() > nowMs) {
-    const blockedUntilIso = sessionData.blockedUntil.toDate().toISOString();
-    throw new HttpsError("resource-exhausted", "Session temporarily blocked due to excessive activity.", {
-      code: "TEMP_BLOCK",
-      blockedUntil: blockedUntilIso,
-    });
-  }
-
-  if (currentFrictionLevel > 0) {
-    if (typeof captchaToken !== "string" || captchaToken.length === 0) {
-      throw new HttpsError("failed-precondition", "Additional verification required to continue.", {
-        code: "CAPTCHA_REQUIRED",
-        frictionLevel: currentFrictionLevel,
-      });
-    }
-
-    const captchaValid = await verifyTurnstileCaptcha(captchaToken, ip);
-    if (!captchaValid) {
-      await sessionRef.set({
-        lastFrictionReason: "captcha-invalid",
-        lastFrictionAt: FieldValue.serverTimestamp(),
-      }, {merge: true}).catch((error) => {
-        logger.warn("Failed to log invalid captcha attempt", {
-          error: error.message,
-          sessionId: hashedToken,
-        });
-      });
-
-      throw new HttpsError("permission-denied", "CAPTCHA verification failed. Try again.", {
-        code: "CAPTCHA_INVALID",
-      });
-    }
-
-    const frictionReduction = Math.min(1, currentFrictionLevel);
-    const captchaUpdates = {
-      lastCaptchaSolvedAt: FieldValue.serverTimestamp(),
-      lastFrictionReason: null,
-    };
-    if (frictionReduction > 0) {
-      captchaUpdates.frictionLevel = FieldValue.increment(-frictionReduction);
-      currentFrictionLevel -= frictionReduction;
-    }
-
-    await sessionRef.set(captchaUpdates, {merge: true}).catch((error) => {
-      logger.warn("Failed to update session after captcha verification", {
-        error: error.message,
-        sessionId: hashedToken,
-      });
-    });
-  }
-
-  try {
-    await sessionRateLimiter.consume(hashedToken);
-  } catch (error) {
-    currentFrictionLevel += 1;
-    const frictionUpdates = {
-      frictionLevel: FieldValue.increment(1),
-      rateLimitedAt: FieldValue.serverTimestamp(),
-      lastFrictionReason: "session-rate-limit",
-    };
-
-    let message = "Too many requests from this session — solve the verification to continue.";
-    const details = {
-      code: "CAPTCHA_REQUIRED",
-      frictionLevel: currentFrictionLevel,
-    };
-
-    if (currentFrictionLevel >= SESSION_FRICTION_THRESHOLD) {
-      const blockedUntilMs = nowMs + SESSION_BLOCK_DURATION_MS;
-      frictionUpdates.blockedUntil = Timestamp.fromMillis(blockedUntilMs);
-      message = "Session temporarily blocked due to excessive activity.";
-      details.code = "TEMP_BLOCK";
-      details.blockedUntil = new Date(blockedUntilMs).toISOString();
-    }
-
-    await sessionRef.set(frictionUpdates, {merge: true}).catch((setError) => {
-      logger.warn("Failed to record friction updates", {
-        error: setError.message,
-        sessionId: hashedToken,
-      });
-    });
-
-    throw new HttpsError("resource-exhausted", message, details);
-  }
-
   const trimmedId = schoolId.trim();
   const schoolRef = firestore.collection("schools").doc(trimmedId);
-  const schoolSnap = await schoolRef.get();
+  const limitRef = firestore.collection(SCHOOL_HOURLY_LIMIT_COLLECTION).doc(trimmedId);
 
-  if (!schoolSnap.exists) {
-    throw new HttpsError("not-found", `School with ID "${trimmedId}" does not exist.`);
-  }
+  const transactionResult = await firestore.runTransaction(async (tx) => {
+    const schoolSnap = await tx.get(schoolRef);
+    if (!schoolSnap.exists) {
+      throw new HttpsError("not-found", `School with ID "${trimmedId}" does not exist.`);
+    }
 
-  const currentScore = schoolSnap.data().score || 0;
-  const maxScore = 1000000000000;
-  const minScore = -1000000000000;
-  const projectedScore = currentScore + delta;
+    const currentScore = schoolSnap.data().score || 0;
+    const maxScore = 1000000000000;
 
-  if (projectedScore > maxScore || projectedScore < minScore) {
-    throw new HttpsError("failed-precondition", "Score update would exceed allowed bounds.");
-  }
+    const limitSnap = await tx.get(limitRef);
+    const now = new Date();
+    now.setMinutes(0, 0, 0);
+    const currentWindowStartMs = now.getTime();
 
-  await schoolRef.update({
-    score: FieldValue.increment(delta),
-  });
+    let usedPoints = 0;
+    if (limitSnap.exists) {
+      const limitData = limitSnap.data() || {};
+      if (limitData.windowStart instanceof Timestamp &&
+        limitData.windowStart.toMillis() === currentWindowStartMs) {
+        usedPoints = Number(limitData.points) || 0;
+      }
+    }
 
-  const clientUserAgent = clientProvidedUserAgent ? clientProvidedUserAgent.slice(0, 500) : null;
+    const remaining = Math.max(0, SCHOOL_HOURLY_LIMIT - usedPoints);
+    const appliedDelta = Math.min(remaining, delta);
 
-  const sessionUpdates = {
-    lastUsedAt: FieldValue.serverTimestamp(),
-    requestCount: FieldValue.increment(1),
-    lastIp: ip,
-    expiresAt: Timestamp.fromMillis(nowMs + SESSION_TTL_MS),
-  };
+    if (appliedDelta <= 0) {
+      tx.set(limitRef, {
+        windowStart: Timestamp.fromMillis(currentWindowStartMs),
+        points: usedPoints,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, {merge: true});
 
-  if (!sessionData.ipAddress || sessionData.ipAddress !== ip) {
-    sessionUpdates.ipAddress = ip;
-  }
+      return {
+        appliedDelta: 0,
+        remaining,
+        limitReached: true,
+      };
+    }
 
-  if (clientUserAgent && clientUserAgent !== sessionData.userAgent) {
-    sessionUpdates.userAgent = clientUserAgent;
-  } else if (!sessionData.userAgent && headerUserAgent !== "unknown") {
-    sessionUpdates.userAgent = headerUserAgent;
-  }
+    const projectedScore = currentScore + appliedDelta;
+    if (projectedScore > maxScore) {
+      throw new HttpsError("failed-precondition", "Score update would exceed allowed bounds.");
+    }
 
-  await sessionRef.set(sessionUpdates, {merge: true}).catch((error) => {
-    logger.warn("Failed to update session metadata after score update", {
-      error: error.message,
-      sessionId: hashedToken,
+    tx.update(schoolRef, {
+      score: FieldValue.increment(appliedDelta),
     });
+
+    tx.set(limitRef, {
+      windowStart: Timestamp.fromMillis(currentWindowStartMs),
+      points: usedPoints + appliedDelta,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, {merge: true});
+
+    return {
+      appliedDelta,
+      remaining: Math.max(0, SCHOOL_HOURLY_LIMIT - (usedPoints + appliedDelta)),
+      limitReached: usedPoints + appliedDelta >= SCHOOL_HOURLY_LIMIT,
+    };
   });
 
   logger.debug("Score update applied", {
     schoolId: trimmedId,
-    delta,
-    sessionId: hashedToken,
+    delta: transactionResult.appliedDelta,
     ip,
+    remainingHourlyQuota: transactionResult.remaining,
   });
 
-  return {success: true};
+  return {
+    success: true,
+    appliedDelta: transactionResult.appliedDelta,
+    remainingHourlyQuota: transactionResult.remaining,
+    hourlyLimitReached: transactionResult.limitReached,
+  };
 });
 
 /**
