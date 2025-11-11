@@ -479,28 +479,6 @@ exports.updateScore = onCall({
     });
   }
 
-  try {
-    await userAgentBurstLimiter.consume(normalizedUserAgent);
-  } catch (error) {
-    const blockedUntilIso = await blockUserAgent(normalizedUserAgent, {
-      ip,
-      sessionId: hashedToken,
-      error: error.message,
-    });
-
-    logger.warn("User agent burst limit exceeded during updateScore; blocked for 24h", {
-      userAgent: normalizedUserAgent,
-      ip,
-      sessionId: hashedToken,
-      blockedUntil: blockedUntilIso,
-    });
-
-    throw new HttpsError("resource-exhausted", "User agent temporarily blocked due to excessive activity.", {
-      code: "USER_AGENT_BLOCKED",
-      blockedUntil: blockedUntilIso,
-    });
-  }
-
   let currentFrictionLevel = sessionData.frictionLevel || 0;
 
   const nowMs = Date.now();
