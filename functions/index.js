@@ -457,12 +457,14 @@ exports.updateScore = onCall({
   }
 
   const sessionData = sessionSnap.data() || {};
-  const clientProvidedUserAgent =
+  let clientProvidedUserAgent = null;
+  if (
     clientContext &&
     typeof clientContext === "object" &&
     typeof clientContext.userAgent === "string"
-      ? clientContext.userAgent
-      : null;
+  ) {
+    clientProvidedUserAgent = clientContext.userAgent;
+  }
   const normalizedUserAgent = normalizeUserAgent(
       clientProvidedUserAgent ||
       sessionData.userAgent ||
