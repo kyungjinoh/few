@@ -440,8 +440,6 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
   const [schoolScore, setSchoolScore] = useState(0); // Local score for immediate UI updates
   
   // Use shared school data from context
-  const [currentSchool, setCurrentSchool] = useState<School | null>(null);
-  const [isDownvoted, setIsDownvoted] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
   const [challengeTextIndex, setChallengeTextIndex] = useState(0);
   const [rotatingTextIndex, setRotatingTextIndex] = useState(0);
@@ -1612,25 +1610,11 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
       }
       
       // Check if this is a new school (different from the one in sessionStorage)
-      const previousSchool = sessionStorage.getItem('currentSchoolSupport');
-      const isNewSchool = previousSchool !== schoolName;
-      
       // Store the current school in sessionStorage for navigation tracking
         // Storing school support in sessionStorage
       sessionStorage.setItem('currentSchoolSupport', schoolName);
       
-      // If it's a new school, reset to blue theme
-      if (isNewSchool) {
-        setIsDownvoted(false);
-        localStorage.setItem('theme', 'blue');
-        localStorage.setItem(`theme_${displayName}`, 'blue');
-      } else {
-        // If it's the same school, restore the saved theme for this school
-        const schoolTheme = localStorage.getItem(`theme_${displayName}`);
-        const globalTheme = localStorage.getItem('theme');
-        const savedTheme = schoolTheme || globalTheme;
-        setIsDownvoted(savedTheme === 'red');
-      }
+      // Theme toggling removed; default is increasing mode
     }
   }, [schoolName, firebaseSchools]);
 
@@ -1674,7 +1658,7 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
             setHasUnsavedChanges(false);
           }
         
-        setCurrentSchool(firebaseSchool);
+        // Firebase school information available
       } else {
         // School doesn't exist in Firebase yet
         const fallbackScore = localScoreValue || 0;
@@ -1684,7 +1668,6 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
         scoreChangesRef.current = 0;
         setHasUnsavedChanges(false);
         console.log('School loaded from localStorage (no Firebase):', schoolDisplayName, 'Score:', fallbackScore);
-        setCurrentSchool(null);
       }
     }
   }, [schoolDisplayName, firebaseSchools.length]); // Remove currentSchool dependency to prevent reset on page switch
@@ -1701,28 +1684,6 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
       window.removeEventListener('beforeunload', handleClearSessionData);
     };
   }, []);
-
-  // Listen for theme changes from localStorage
-  useEffect(() => {
-    const handleStorageChange = () => {
-      if (schoolDisplayName) {
-        const schoolTheme = localStorage.getItem(`theme_${schoolDisplayName}`);
-        const globalTheme = localStorage.getItem('theme');
-        const savedTheme = schoolTheme || globalTheme;
-        setIsDownvoted(savedTheme === 'red');
-      }
-    };
-
-    // Listen for storage changes (from other tabs)
-    window.addEventListener('storage', handleStorageChange);
-    
-    // Also check on mount in case theme was changed in same tab
-    handleStorageChange();
-
-    return () => {
-      window.removeEventListener('storage', handleStorageChange);
-    };
-  }, [schoolDisplayName]);
 
   const handleShare = async () => {
     try {
@@ -2007,60 +1968,28 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
       mouseEvent = event as React.MouseEvent;
     }
     
-    // In downvote mode, use 2x multiplier for decrease
-    const downvoteMultiplier = isDownvoted ? multiplier * 2 : multiplier;
-    createFloatingNumber(downvoteMultiplier, mouseEvent);
+    createFloatingNumber(multiplier, mouseEvent);
     
-    // Update school score and save to localStorage immediately
-    if (isDownvoted) {
-      // In red mode, decrease school score by 2x multiplier
-      setSchoolScore(prev => {
-        const minScore = -1000000000000;
-        const newSchoolScore = Math.max(minScore, prev - downvoteMultiplier);
-        // Save to localStorage immediately
-        localStorage.setItem(`schoolScore_${schoolDisplayName}`, newSchoolScore.toString());
-        
-        // Trigger score animation
-        setIsScoreAnimating(true);
-        setTimeout(() => setIsScoreAnimating(false), 300);
-        
-        // Check for rank improvements (pass both old and new scores)
-        _checkRankImprovement(prev, newSchoolScore);
-        
-        return newSchoolScore;
-      });
-      setScoreChanges(prev => {
-        const newValue = prev - downvoteMultiplier;
-        scoreChangesRef.current = newValue;
-        setHasUnsavedChanges(true);
-        return newValue;
-      });
-    } else {
-      // In blue mode, increase school score (with overflow protection)
-      setSchoolScore(prev => {
-        // Cap score at 1 trillion to prevent overflow
-        const maxScore = 1000000000000;
-        const newSchoolScore = Math.min(maxScore, prev + multiplier);
-        
-        // Save to localStorage immediately
-        localStorage.setItem(`schoolScore_${schoolDisplayName}`, newSchoolScore.toString());
-        
-        // Trigger score animation
-        setIsScoreAnimating(true);
-        setTimeout(() => setIsScoreAnimating(false), 300);
-        
-        // Check for rank improvements (pass both old and new scores)
-        _checkRankImprovement(prev, newSchoolScore);
-        
-        return newSchoolScore;
-      });
-      setScoreChanges(prev => {
-        const newValue = prev + multiplier;
-        scoreChangesRef.current = newValue;
-        setHasUnsavedChanges(true);
-        return newValue;
-      });
-    }
+    // Increase school score (with overflow protection)
+    setSchoolScore(prev => {
+      const maxScore = 1000000000000;
+      const newSchoolScore = Math.min(maxScore, prev + multiplier);
+      
+      localStorage.setItem(`schoolScore_${schoolDisplayName}`, newSchoolScore.toString());
+      
+      setIsScoreAnimating(true);
+      setTimeout(() => setIsScoreAnimating(false), 300);
+      
+      _checkRankImprovement(prev, newSchoolScore);
+      
+      return newSchoolScore;
+    });
+    setScoreChanges(prev => {
+      const newValue = prev + multiplier;
+      scoreChangesRef.current = newValue;
+      setHasUnsavedChanges(true);
+      return newValue;
+    });
   };
 
 
@@ -2120,20 +2049,6 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
     // Very short delay to ensure scaling is visible
     setTimeout(() => setIsLogoPressed(false), 10);
   }, []);
-
-  const handleUpvote = () => {
-    // Blue arrow button toggles back to blue theme
-    setIsDownvoted(false);
-    localStorage.setItem('theme', 'blue');
-    localStorage.setItem(`theme_${schoolDisplayName}`, 'blue');
-  };
-
-  const handleDownvote = () => {
-    // Red arrow button toggles to red theme
-    setIsDownvoted(true);
-    localStorage.setItem('theme', 'red');
-    localStorage.setItem(`theme_${schoolDisplayName}`, 'red');
-  };
 
   const formatNumber = (num: number) => {
     return num.toLocaleString();
@@ -2463,7 +2378,7 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
         </div>
       </div>
     )}
-    <div className={`w-full h-screen-dvh flex flex-col overflow-hidden select-none ${isDownvoted ? 'bg-[#D10003]' : 'bg-[#006aff]'}`}>
+    <div className="w-full h-screen-dvh flex flex-col overflow-hidden select-none bg-[#006aff]">
       {/* Top Bar with thin gradient line */}
         <div 
           className="w-full h-[10vh] min-h-[60px] lg:min-h-[80px] bg-black flex items-center justify-between px-4 lg:px-6 xl:px-8 top-navigation-bar" 
@@ -2744,100 +2659,30 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
                   transform: 'translate(-50%, -50%)',
                 }}
               >
-                <span className={`text-3xl font-black drop-shadow-lg text-stroke ${isDownvoted ? 'text-red-500' : 'text-blue-500'}`}>
-                  {isDownvoted ? '-' : '+'}{floatingNum.value}
+                <span className="text-3xl font-black drop-shadow-lg text-stroke text-blue-500">
+                  +{floatingNum.value}
                 </span>
               </div>
             ))}
           </div>
           </div>
 
-        {/* Desktop: Arrow Buttons */}
-        <div className="hidden md:block">
-          {/* Left Arrow */}
-          <div className="fixed left-4 bottom-[29vh] z-20">
-            <div className="flex flex-col items-center gap-3">
-              <button
-                type="button"
-                onClick={() => setIsMysteryBoxOpen(true)}
-                className="w-24 lg:w-28 xl:w-32 2xl:w-36 h-24 lg:h-28 xl:h-32 2xl:h-36 rounded-3xl bg-black text-white font-pixelify font-bold text-4xl lg:text-5xl xl:text-6xl 2xl:text-7xl flex items-center justify-center select-none border border-white/20 shadow-[0_18px_35px_rgba(0,0,0,0.45)] transition-transform transition-colors duration-200 hover:bg-black/90 hover:scale-105"
-              >
-                ?
-              </button>
-              <div className={`w-24 lg:w-28 xl:w-32 2xl:w-36 h-24 lg:h-28 xl:h-32 2xl:h-36 rounded-3xl cursor-pointer transition-colors flex flex-col items-center justify-center ${isDownvoted ? 'bg-[#ff4444] scale-95' : 'bg-[#ff6e6e] hover:bg-[#ff5555]'}`}
-                   onClick={handleDownvote}>
-                <img 
-                  className="w-12 lg:w-16 xl:w-20 2xl:w-24 h-12 lg:h-16 xl:h-20 2xl:h-24" 
-                  src="/icons/Army Knife.svg" 
-                  alt="Army Knife" 
-                  draggable={false}
-                />
-                <span className="text-white font-pixelify font-bold text-[8px] lg:text-[10px] xl:text-xs mt-0.5 text-center leading-tight">Decrease by 2x</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Right Arrow */}
-          <div className="fixed right-4 bottom-[29vh] z-20">
-            <div className={`w-24 lg:w-28 xl:w-32 2xl:w-36 h-24 lg:h-28 xl:h-32 2xl:h-36 rounded-3xl cursor-pointer transition-colors flex items-center justify-center ${!isDownvoted ? 'bg-[#0099cc] scale-95' : 'bg-[#00ddff] hover:bg-[#00c4e6]'}`}
-                 onClick={handleUpvote}>
-              <img 
-                className="w-16 lg:w-20 xl:w-24 2xl:w-28 h-16 lg:h-20 xl:h-24 2xl:h-28" 
-                src="/icons/Love.svg" 
-                alt="Love" 
-                draggable={false}
-              />
-            </div>
-          </div>
-        </div>
-
         {/* Bottom Section - Action Buttons (25-30% of screen) */}
         <div className="flex-1 flex flex-col items-center justify-center">
-          {/* Voting Buttons */}
-          {/* Mobile: Fixed positioned arrows - red left, blue right */}
-          <div className="fixed left-4 bottom-[22vh] z-20 md:hidden">
-            <div className="flex flex-col items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setIsMysteryBoxOpen(true)}
-                className="w-16 h-16 rounded-3xl bg-black text-white font-pixelify font-bold text-3xl flex items-center justify-center select-none border border-white/20 shadow-[0_12px_25px_rgba(0,0,0,0.45)] transition-transform transition-colors duration-200 hover:bg-black/90 hover:scale-105"
-              >
-                ?
-              </button>
-              <div className={`w-16 h-16 rounded-3xl cursor-pointer transition-colors flex flex-col items-center justify-center ${isDownvoted ? 'bg-[#ff4444] scale-95' : 'bg-[#ff6e6e] hover:bg-[#ff5555]'}`}
-                   onClick={handleDownvote}>
-                <img 
-                    className="w-8 h-8" 
-                  src="/icons/Army Knife.svg" 
-                  alt="Downvote" 
-                  draggable={false}
-                />
-                <span className="text-white font-pixelify font-bold text-[7px] mt-0.5 text-center leading-tight px-0.5">Decrease by 2x</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="fixed right-4 bottom-[22vh] z-20 md:hidden">
-            <div className={`w-16 h-16 rounded-3xl cursor-pointer transition-colors flex items-center justify-center ${!isDownvoted ? 'bg-[#0099cc] scale-95' : 'bg-[#00ddff] hover:bg-[#00c4e6]'}`}
-               onClick={handleUpvote}>
-            <img 
-                className="w-10 h-10" 
-              src="/icons/Love.svg" 
-              alt="Upvote" 
-              draggable={false}
-            />
-          </div>
-          </div>
-
+          <button
+            type="button"
+            onClick={() => setIsMysteryBoxOpen(true)}
+            className="fixed left-4 bottom-[calc(12vh+120px)] z-20 w-16 h-16 rounded-3xl bg-black text-white font-pixelify font-bold text-3xl flex items-center justify-center select-none border border-white/20 shadow-[0_12px_25px_rgba(0,0,0,0.45)] transition-transform transition-colors duration-200 hover:bg-black/90 hover:scale-105 sm:left-6 sm:bottom-[calc(12vh+140px)]"
+          >
+            ?
+          </button>
 
           {/* Challenge Friend Button */}
         <div 
             className={`w-48 sm:w-72 md:w-[280px] lg:w-[280px] xl:w-[320px] 2xl:w-[360px] h-10 sm:h-14 md:h-12 lg:h-12 xl:h-14 2xl:h-16 rounded-3xl flex items-center justify-center cursor-pointer transition-all duration-200 shadow-2xl border-2 active:scale-95 mb-2 sm:mb-4 mt-4 sm:mt-6 md:mt-0 fixed left-1/2 transform -translate-x-1/2 bottom-[21vh] z-20 sm:relative sm:left-auto sm:transform-none sm:bottom-auto md:fixed md:right-4 md:top-[12vh] md:transform-none md:bottom-auto lg:fixed lg:right-4 lg:top-[12vh] lg:transform-none lg:bottom-auto xl:fixed xl:right-4 xl:top-[12vh] xl:transform-none xl:bottom-auto 2xl:fixed 2xl:right-4 2xl:top-[12vh] 2xl:transform-none 2xl:bottom-auto 3xl:fixed 3xl:right-4 3xl:top-[12vh] 3xl:transform-none 3xl:bottom-auto ${
             showCopiedMessage 
               ? 'bg-white border-gray-300' 
-              : isDownvoted 
-                ? 'bg-gradient-to-b from-red-500 to-red-700 hover:from-red-400 hover:to-red-600 border-red-400 hover:border-red-300' 
-                : 'bg-gradient-to-b from-blue-500 to-blue-700 hover:from-blue-400 hover:to-blue-600 border-blue-400 hover:border-blue-300'
+              : 'bg-gradient-to-b from-blue-500 to-blue-700 hover:from-blue-400 hover:to-blue-600 border-blue-400 hover:border-blue-300'
           }`}
           onClick={handleChallengeClick}>
             {showCopiedMessage ? (
@@ -3179,20 +3024,13 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
 
             {/* Right Section - Score and Progress */}
             <div className="flex flex-col items-end flex-shrink-0">
-              <div className={`font-pixelify font-bold text-3xl lg:text-4xl xl:text-5xl tracking-[0] leading-[normal] text-center transition-all duration-300 ${isScoreAnimating ? 'scale-110 text-yellow-300' : ''} ${isDownvoted ? 'text-[#D10003]' : 'text-[#006aff]'}`}>
+              <div className={`font-pixelify font-bold text-3xl lg:text-4xl xl:text-5xl tracking-[0] leading-[normal] text-center transition-all duration-300 ${isScoreAnimating ? 'scale-110 text-yellow-300' : ''} text-[#006aff]`}>
                 {formatNumber(schoolScore)}
               </div>
               <div className="opacity-[0.63] font-pixelify font-normal text-black text-base lg:text-lg xl:text-xl tracking-[0] leading-[normal] text-center flex items-center justify-center">
-                {isDownvoted ? (
-                    <>
-                      {formatNumber(calculateScoreDifference(schoolDisplayName, schoolScore, currentRank + 1))}+ to rank
-                      <img src="/icons/Thick Arrow Pointing Down.svg" alt="Down arrow" className="w-3 h-3 ml-1" draggable="false" />
-                    </>
-                  ) : (
-                    currentRank === 1 
-                      ? `${formatNumber(calculateScoreDifference(schoolDisplayName, schoolScore, 2))}+ ahead of #2`
-                      : `${formatNumber(calculateScoreDifference(schoolDisplayName, schoolScore, currentRank - 1))}+ til #${currentRank - 1}`
-                  )}
+                {currentRank === 1 
+                  ? `${formatNumber(calculateScoreDifference(schoolDisplayName, schoolScore, 2))}+ ahead of #2`
+                  : `${formatNumber(calculateScoreDifference(schoolDisplayName, schoolScore, currentRank - 1))}+ til #${currentRank - 1}`}
               </div>
             </div>
           </div>
@@ -3252,20 +3090,13 @@ export const SchoolSupportPage: React.FC<SchoolSupportPageProps> = ({ isMuted, o
           {/* Right Section - Score and Progress */}
           <div className="flex items-center flex-shrink-0">
             <div className="flex flex-col items-center">
-              <div className={`font-pixelify font-bold text-lg tracking-[0] leading-[normal] transition-all duration-300 ${isScoreAnimating ? 'scale-110 text-yellow-300' : ''} ${isDownvoted ? 'text-[#D10003]' : 'text-[#006aff]'}`}>
+              <div className={`font-pixelify font-bold text-lg tracking-[0] leading-[normal] transition-all duration-300 ${isScoreAnimating ? 'scale-110 text-yellow-300' : ''} text-[#006aff]`}>
                 {formatNumber(schoolScore)}
               </div>
               <div className="opacity-70 font-pixelify font-normal text-black text-[10px] tracking-[0] leading-[normal] text-center flex items-center justify-center">
-                {isDownvoted ? (
-                    <>
-                      {formatNumber(calculateScoreDifference(schoolDisplayName, schoolScore, currentRank + 1))}+ to rank
-                      <img src="/icons/Thick Arrow Pointing Down.svg" alt="Down arrow" className="w-3 h-3 ml-1" draggable="false" />
-                    </>
-                  ) : (
-                    currentRank === 1 
-                      ? `${formatNumber(calculateScoreDifference(schoolDisplayName, schoolScore, 2))}+ ahead of #2`
-                      : `${formatNumber(calculateScoreDifference(schoolDisplayName, schoolScore, currentRank - 1))}+ til #${currentRank - 1}`
-                )}
+                {currentRank === 1 
+                  ? `${formatNumber(calculateScoreDifference(schoolDisplayName, schoolScore, 2))}+ ahead of #2`
+                  : `${formatNumber(calculateScoreDifference(schoolDisplayName, schoolScore, currentRank - 1))}+ til #${currentRank - 1}`}
               </div>
             </div>
           </div>

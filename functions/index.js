@@ -323,7 +323,7 @@ exports.updateScore = onCall({
     clientContext,
   } = data;
 
-  const deltaErrorMessage = "Invalid delta — only values between -1000 and +500 (excluding 0) are allowed.";
+  const deltaErrorMessage = "Invalid delta — only values between 0 and +500 are allowed.";
 
   if (typeof schoolId !== "string" || !schoolId.trim()) {
     throw new HttpsError("invalid-argument", "Missing or invalid schoolId.");
@@ -332,8 +332,8 @@ exports.updateScore = onCall({
   const isDeltaValid =
     typeof delta === "number" &&
     Number.isFinite(delta) &&
-    delta !== 0 &&
-    ((delta > 0 && delta <= 500) || (delta < 0 && delta >= -1000));
+    delta >= 0 &&
+    delta <= 500;
 
   if (!isDeltaValid) {
     throw new HttpsError("invalid-argument", deltaErrorMessage);
