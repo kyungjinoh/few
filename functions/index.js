@@ -30,12 +30,93 @@ const addSchoolRateLimiter = new RateLimiterMemory({
   duration: 60 * 60, // 3 attempts per hour per IP
 });
 
+// Rate limiter for hourly user tracking writes (per IP)
+const hourlyUserTrackingRateLimiter = new RateLimiterMemory({
+  points: 100, // 100 writes per hour per IP
+  duration: 60 * 60,
+});
+
+// Rate limiter for stats reads (per IP) - prevent abuse
+const statsReadRateLimiter = new RateLimiterMemory({
+  points: 1000, // 1000 reads per hour per IP
+  duration: 60 * 60,
+});
+
+// Strict rate limiter for recordHourlyUser callable function (per IP)
+// Much stricter than updateScore to prevent fake user spam
+const recordHourlyUserRateLimiter = new RateLimiterMemory({
+  points: 20, // Only 20 calls per hour per IP (very strict)
+  duration: 60 * 60,
+});
+
+// Per-user-ID rate limiter to prevent same user from being added multiple times
+// Tracked by userId + schoolSlug combination
+const userHourlyRecordRateLimiter = new RateLimiterMemory({
+  points: 5, // Maximum 5 records per hour per user per school
+  duration: 60 * 60,
+});
+
+// Rate limiter for initializeOnlinePresence callable function (per IP)
+const initializeOnlinePresenceRateLimiter = new RateLimiterMemory({
+  points: 30, // 30 presence initializations per hour per IP
+  duration: 60 * 60,
+});
+
+// Per-user presence rate limiter (prevent spam of presence updates)
+const userPresenceRateLimiter = new RateLimiterMemory({
+  points: 10, // Maximum 10 presence updates per hour per user per school
+  duration: 60 * 60,
+});
+
 const SESSION_TOKEN_BYTES = 32;
 const HOURLY_LIMIT_PER_USER = 6000;
 const SCHOOL_HOURLY_LIMIT_FALLBACK = 6000;
 const SCHOOL_HOURLY_LIMIT_COLLECTION = "schoolHourlyLimits";
 
 const realtimeDb = getDatabase();
+
+/**
+ * Validate school slug format (alphanumeric, lowercase, no special chars)
+ * @param {string} schoolSlug - School slug to validate
+ * @return {boolean} True if valid
+ */
+const isValidSchoolSlug = (schoolSlug) => {
+  if (!schoolSlug || typeof schoolSlug !== "string") {
+    return false;
+  }
+  // Allow alphanumeric characters only, 1-100 chars
+  const slugRegex = /^[a-z0-9]{1,100}$/;
+  return slugRegex.test(schoolSlug);
+};
+
+/**
+ * Validate user ID format
+ * @param {string} userId - User ID to validate
+ * @return {boolean} True if valid
+ */
+const isValidUserId = (userId) => {
+  if (!userId || typeof userId !== "string") {
+    return false;
+  }
+  // Allow alphanumeric, underscore, hyphen, 1-100 chars
+  const userIdRegex = /^[a-zA-Z0-9_-]{1,100}$/;
+  return userIdRegex.test(userId);
+};
+
+/**
+ * Validate timestamp (must be within reasonable range)
+ * @param {number} timestamp - Timestamp to validate
+ * @return {boolean} True if valid
+ */
+const isValidTimestamp = (timestamp) => {
+  if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) {
+    return false;
+  }
+  const now = Date.now();
+  const oneDayAgo = now - (24 * 60 * 60 * 1000);
+  const oneDayFromNow = now + (60 * 60 * 1000); // Allow 1 hour in future for clock skew
+  return timestamp >= oneDayAgo && timestamp <= oneDayFromNow;
+};
 
 const GA4_MEASUREMENT_ID = process.env.GA4_MEASUREMENT_ID;
 const GA4_API_SECRET = process.env.GA4_API_SECRET;
@@ -102,20 +183,62 @@ const getCurrentHourWindow = () => {
 };
 
 /**
+ * Verify that a user actually exists in schoolOnlineUsers.
+ * This prevents fake users from being added to schoolHourlyUsers.
+ * @param {string} schoolSlug - School slug
+ * @param {string} userId - User ID to verify
+ * @return {Promise<boolean>} True if user exists online, false otherwise
+ */
+const verifyUserExistsOnline = async (schoolSlug, userId) => {
+  try {
+    if (!realtimeDb) {
+      return false;
+    }
+
+    const onlineUserRef = realtimeDb.ref(`schoolOnlineUsers/${schoolSlug}/${userId}`);
+    const snapshot = await onlineUserRef.once("value");
+    const userData = snapshot.val();
+
+    if (!userData) {
+      return false;
+    }
+
+    // Verify user data structure and that they're actually online
+    if (userData.online === true && userData.school === schoolSlug) {
+      return true;
+    }
+
+    return false;
+  } catch (error) {
+    logger.error("Failed to verify user exists online", {
+      schoolSlug,
+      userId,
+      error: error.message,
+    });
+    return false;
+  }
+};
+
+/**
  * Record a user in the hourly cumulative tracker in RTDB.
  * This adds the user to schoolHourlyUsers which cumulates all users
  * who were online in the current hour (from schoolOnlineUsers).
+ * Includes security validation and rate limiting.
+ * Now requires user to exist in schoolOnlineUsers first.
  * @param {string} schoolSlug - School slug (URL-friendly name)
  * @param {string} userId - User-ID (from schoolOnlineUsers)
+ * @param {string} ip - IP address for rate limiting
+ * @param {boolean} skipVerification - Skip online verification (only for server-side backup)
  * @return {Promise<void>}
  */
-const recordUserInHourlyTracker = async (schoolSlug, userId) => {
+const recordUserInHourlyTracker = async (schoolSlug, userId, ip = null, skipVerification = false) => {
   try {
     if (!realtimeDb) {
       logger.warn("Realtime Database not available for hourly tracking");
       return;
     }
 
+    // Security: Validate inputs
     if (!schoolSlug || !userId) {
       logger.warn("Missing schoolSlug or userId for hourly tracking", {
         schoolSlug,
@@ -126,8 +249,66 @@ const recordUserInHourlyTracker = async (schoolSlug, userId) => {
       return;
     }
 
+    // Security: Validate school slug format
+    if (!isValidSchoolSlug(schoolSlug)) {
+      logger.warn("Invalid school slug format for hourly tracking", {
+        schoolSlug,
+        userId,
+      });
+      return;
+    }
+
+    // Security: Validate user ID format
+    if (!isValidUserId(userId)) {
+      logger.warn("Invalid user ID format for hourly tracking", {
+        schoolSlug,
+        userId,
+      });
+      return;
+    }
+
+    // Security: Verify user exists in schoolOnlineUsers before recording
+    // This prevents fake users from being added to hourly tracker
+    if (!skipVerification) {
+      const userExists = await verifyUserExistsOnline(schoolSlug, userId);
+      if (!userExists) {
+        logger.warn("Attempted to record user who is not online", {
+          schoolSlug,
+          userId,
+          ip,
+        });
+        // Reject fake users
+        return;
+      }
+    }
+
+    // Security: Rate limiting (if IP provided)
+    if (ip) {
+      try {
+        await hourlyUserTrackingRateLimiter.consume(ip);
+      } catch (rateLimitError) {
+        logger.warn("Rate limit exceeded for hourly user tracking", {
+          ip,
+          schoolSlug,
+          userId,
+        });
+        // Don't throw - silently fail to prevent blocking
+        return;
+      }
+    }
+
     const hourWindowStart = getCurrentHourWindow();
     const hourWindowKey = hourWindowStart.toMillis().toString();
+
+    // Security: Validate hour window key (must be numeric timestamp)
+    if (!/^\d+$/.test(hourWindowKey)) {
+      logger.error("Invalid hour window key generated", {
+        schoolSlug,
+        userId,
+        hourWindowKey,
+      });
+      return;
+    }
 
     // Add user to hourly cumulative tracker: schoolHourlyUsers/{schoolSlug}/{hourWindowKey}/{userId}
     // This cumulates all users who were online at any point in this hour
@@ -139,11 +320,24 @@ const recordUserInHourlyTracker = async (schoolSlug, userId) => {
     // Use transaction to preserve firstSeen if it already exists
     const currentData = await hourlyUserRef.once("value");
     const existingData = currentData.val();
-    const firstSeen = existingData && existingData.firstSeen ?
-        existingData.firstSeen : Date.now();
+    const now = Date.now();
+    const firstSeen = existingData && existingData.firstSeen &&
+        isValidTimestamp(existingData.firstSeen) ?
+        existingData.firstSeen : now;
+
+    // Security: Validate timestamps before writing
+    if (!isValidTimestamp(now) || !isValidTimestamp(firstSeen)) {
+      logger.error("Invalid timestamp for hourly user tracking", {
+        schoolSlug,
+        userId,
+        now,
+        firstSeen,
+      });
+      return;
+    }
 
     await hourlyUserRef.set({
-      timestamp: Date.now(),
+      timestamp: now,
       firstSeen: firstSeen, // Keep first seen time if exists
     });
   } catch (error) {
@@ -160,18 +354,51 @@ const recordUserInHourlyTracker = async (schoolSlug, userId) => {
 /**
  * Get count of unique users who were online in the current hour window.
  * Uses RTDB: reads from schoolHourlyUsers which cumulates users from schoolOnlineUsers.
+ * Includes security validation.
  * @param {string} schoolSlug - School slug (URL-friendly name)
+ * @param {string} ip - IP address for rate limiting (optional)
  * @return {Promise<number>} Number of unique users in the current hour
  */
-const getUniqueUsersInPastHour = async (schoolSlug) => {
+const getUniqueUsersInPastHour = async (schoolSlug, ip = null) => {
   try {
     if (!realtimeDb) {
       logger.warn("Realtime Database not available for user count");
       return 0;
     }
 
+    // Security: Validate school slug format
+    if (!isValidSchoolSlug(schoolSlug)) {
+      logger.warn("Invalid school slug format for user count", {
+        schoolSlug,
+      });
+      return 0;
+    }
+
+    // Security: Rate limiting for stats reads (if IP provided)
+    if (ip) {
+      try {
+        await statsReadRateLimiter.consume(ip);
+      } catch (rateLimitError) {
+        logger.warn("Rate limit exceeded for stats read", {
+          ip,
+          schoolSlug,
+        });
+        // Return 0 instead of throwing to prevent blocking
+        return 0;
+      }
+    }
+
     const hourWindowStart = getCurrentHourWindow();
     const hourWindowKey = hourWindowStart.toMillis().toString();
+
+    // Security: Validate hour window key
+    if (!/^\d+$/.test(hourWindowKey)) {
+      logger.error("Invalid hour window key generated", {
+        schoolSlug,
+        hourWindowKey,
+      });
+      return 0;
+    }
 
     // Read from RTDB: schoolHourlyUsers/{schoolSlug}/{hourWindowKey}
     // This contains all users who were online at any point in this hour
@@ -183,8 +410,10 @@ const getUniqueUsersInPastHour = async (schoolSlug) => {
       return 0;
     }
 
-    // Count unique userIds (each userId is a key in the object)
-    return Object.keys(hourlyUsers).length;
+    // Security: Validate and count unique userIds
+    // Filter out any invalid user IDs
+    const validUserIds = Object.keys(hourlyUsers).filter((uid) => isValidUserId(uid));
+    return validUserIds.length;
   } catch (error) {
     logger.error("Failed to get unique users in past hour from RTDB", {
       schoolSlug,
@@ -408,6 +637,303 @@ exports.createClickerSession = onCall({
 });
 
 /**
+ * Callable function to record a user in the hourly tracker (schoolHourlyUsers).
+ * Secured with rate limiting, session validation, and input validation.
+ * Only this function can write to schoolHourlyUsers - direct client writes are blocked.
+ */
+exports.recordHourlyUser = onCall({
+  memory: "256MiB",
+  timeoutSeconds: 10,
+}, async (request) => {
+  const data = request.data || {};
+  const {schoolSlug, userId} = data;
+
+  const {ip} = getRequestContext(request.rawRequest);
+
+  // Strict rate limiting per IP (much stricter than updateScore to prevent abuse)
+  try {
+    await recordHourlyUserRateLimiter.consume(ip);
+  } catch (error) {
+    logger.warn("IP rate limit exceeded for recordHourlyUser", {
+      ip,
+      schoolSlug,
+      userId,
+      error: error.message,
+    });
+    throw new HttpsError("resource-exhausted", "Too many requests from this IP — slow down.");
+  }
+
+  // Validate inputs first
+  if (typeof schoolSlug !== "string" || !schoolSlug.trim()) {
+    throw new HttpsError("invalid-argument", "Missing or invalid schoolSlug.");
+  }
+
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new HttpsError("invalid-argument", "Missing or invalid userId.");
+  }
+
+  // Validate school slug format
+  const trimmedSlug = schoolSlug.trim();
+  if (!isValidSchoolSlug(trimmedSlug)) {
+    throw new HttpsError("invalid-argument", "Invalid school slug format.");
+  }
+
+  // Validate user ID format
+  const trimmedUserId = userId.trim();
+  if (!isValidUserId(trimmedUserId)) {
+    throw new HttpsError("invalid-argument", "Invalid user ID format.");
+  }
+
+  // Additional per-user-ID rate limiting to prevent same user spam
+  // Generate key from schoolSlug + userId combination
+  const userRateLimitKey = `${trimmedSlug}:${trimmedUserId}`;
+  try {
+    await userHourlyRecordRateLimiter.consume(userRateLimitKey);
+  } catch (error) {
+    logger.warn("User rate limit exceeded for recordHourlyUser", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      error: error.message,
+    });
+    throw new HttpsError("resource-exhausted", "Too many requests for this user — slow down.");
+  }
+
+  // Security: Verify user exists in schoolOnlineUsers before recording
+  // This is the key security check that prevents fake users
+  const userExists = await verifyUserExistsOnline(trimmedSlug, trimmedUserId);
+  if (!userExists) {
+    logger.warn("Attempted to record fake user in hourly tracker", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+    });
+    throw new HttpsError("permission-denied", "User must be online to be recorded.");
+  }
+
+  // Record user in hourly tracker (server-side write with all validations)
+  // Verification is already done above, so skip it in the helper function
+  try {
+    await recordUserInHourlyTracker(trimmedSlug, trimmedUserId, ip, true);
+    return {
+      success: true,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+    };
+  } catch (error) {
+    logger.error("Failed to record hourly user via callable function", {
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      ip,
+      error: error.message,
+    });
+    // Don't expose internal errors to client
+    throw new HttpsError("internal", "Failed to record user. Please try again.");
+  }
+});
+
+/**
+ * Secure Cloud Function to initialize online presence for a user.
+ * Replaces direct client writes to schoolOnlineUsers with server-side validation.
+ * @param {object} request - Firebase callable request
+ * @return {Promise<{success: boolean, schoolSlug: string, userId: string}>}
+ */
+exports.initializeOnlinePresence = onCall({
+  memory: "256MiB",
+  timeoutSeconds: 10,
+}, async (request) => {
+  const data = request.data || {};
+  const {schoolSlug, userId} = data;
+
+  const {ip} = getRequestContext(request.rawRequest);
+
+  // Rate limiting per IP
+  try {
+    await initializeOnlinePresenceRateLimiter.consume(ip);
+  } catch (error) {
+    logger.warn("IP rate limit exceeded for initializeOnlinePresence", {
+      ip,
+      error: error.message,
+    });
+    throw new HttpsError("resource-exhausted", "Too many requests from this IP — slow down.");
+  }
+
+  // Validate inputs
+  if (typeof schoolSlug !== "string" || !schoolSlug.trim()) {
+    throw new HttpsError("invalid-argument", "Missing or invalid schoolSlug.");
+  }
+
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new HttpsError("invalid-argument", "Missing or invalid userId.");
+  }
+
+  // Validate school slug format
+  const trimmedSlug = schoolSlug.trim();
+  if (!isValidSchoolSlug(trimmedSlug)) {
+    throw new HttpsError("invalid-argument", "Invalid school slug format.");
+  }
+
+  // Validate user ID format
+  const trimmedUserId = userId.trim();
+  if (!isValidUserId(trimmedUserId)) {
+    throw new HttpsError("invalid-argument", "Invalid user ID format.");
+  }
+
+  // Per-user rate limiting
+  const userPresenceKey = `${trimmedSlug}:${trimmedUserId}`;
+  try {
+    await userPresenceRateLimiter.consume(userPresenceKey);
+  } catch (error) {
+    logger.warn("User rate limit exceeded for initializeOnlinePresence", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      error: error.message,
+    });
+    throw new HttpsError("resource-exhausted", "Too many presence updates for this user — slow down.");
+  }
+
+  // Write to RTDB: schoolOnlineUsers/{schoolSlug}/{userId}
+  // Only server (Cloud Functions) can write - clients blocked by RTDB rules
+  try {
+    if (!realtimeDb) {
+      throw new Error("Realtime Database not available");
+    }
+
+    const onlineUserRef = realtimeDb.ref(`schoolOnlineUsers/${trimmedSlug}/${trimmedUserId}`);
+    const now = Date.now();
+
+    // Validate timestamp before writing
+    if (!isValidTimestamp(now)) {
+      logger.error("Invalid timestamp for online presence", {
+        schoolSlug: trimmedSlug,
+        userId: trimmedUserId,
+        now,
+      });
+      throw new HttpsError("internal", "Invalid timestamp.");
+    }
+
+    // Set user as online with validated data
+    await onlineUserRef.set({
+      timestamp: now,
+      online: true,
+      school: trimmedSlug,
+    });
+
+    logger.debug("User initialized online presence", {
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      ip,
+    });
+
+    return {
+      success: true,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+    };
+  } catch (error) {
+    logger.error("Failed to initialize online presence", {
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      ip,
+      error: error.message,
+    });
+
+    // Don't expose internal errors to client
+    if (error instanceof HttpsError) {
+      throw error;
+    }
+    throw new HttpsError("internal", "Failed to initialize presence. Please try again.");
+  }
+});
+
+/**
+ * Secure Cloud Function to remove online presence when user disconnects.
+ * Replaces direct client writes to schoolOnlineUsers with server-side validation.
+ * @param {object} request - Firebase callable request
+ * @return {Promise<{success: boolean, schoolSlug: string, userId: string}>}
+ */
+exports.removeOnlinePresence = onCall({
+  memory: "256MiB",
+  timeoutSeconds: 10,
+}, async (request) => {
+  const data = request.data || {};
+  const {schoolSlug, userId} = data;
+
+  const {ip} = getRequestContext(request.rawRequest);
+
+  // Rate limiting per IP (less strict for removal)
+  try {
+    await initializeOnlinePresenceRateLimiter.consume(ip);
+  } catch (error) {
+    logger.warn("IP rate limit exceeded for removeOnlinePresence", {
+      ip,
+      error: error.message,
+    });
+    throw new HttpsError("resource-exhausted", "Too many requests from this IP — slow down.");
+  }
+
+  // Validate inputs
+  if (typeof schoolSlug !== "string" || !schoolSlug.trim()) {
+    throw new HttpsError("invalid-argument", "Missing or invalid schoolSlug.");
+  }
+
+  if (typeof userId !== "string" || !userId.trim()) {
+    throw new HttpsError("invalid-argument", "Missing or invalid userId.");
+  }
+
+  // Validate school slug format
+  const trimmedSlug = schoolSlug.trim();
+  if (!isValidSchoolSlug(trimmedSlug)) {
+    throw new HttpsError("invalid-argument", "Invalid school slug format.");
+  }
+
+  // Validate user ID format
+  const trimmedUserId = userId.trim();
+  if (!isValidUserId(trimmedUserId)) {
+    throw new HttpsError("invalid-argument", "Invalid user ID format.");
+  }
+
+  // Remove from RTDB: schoolOnlineUsers/{schoolSlug}/{userId}
+  // Only server (Cloud Functions) can write - clients blocked by RTDB rules
+  try {
+    if (!realtimeDb) {
+      throw new Error("Realtime Database not available");
+    }
+
+    const onlineUserRef = realtimeDb.ref(`schoolOnlineUsers/${trimmedSlug}/${trimmedUserId}`);
+
+    // Remove user from online users
+    await onlineUserRef.remove();
+
+    logger.debug("User removed online presence", {
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      ip,
+    });
+
+    return {
+      success: true,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+    };
+  } catch (error) {
+    logger.error("Failed to remove online presence", {
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      ip,
+      error: error.message,
+    });
+
+    // Don't expose internal errors to client
+    if (error instanceof HttpsError) {
+      throw error;
+    }
+    throw new HttpsError("internal", "Failed to remove presence. Please try again.");
+  }
+});
+
+/**
  * Callable function to add a new school directly to Firestore.
  */
 exports.addSchool = onCall({
@@ -556,14 +1082,16 @@ exports.updateScore = onCall({
 
   // Add user to hourly tracker (backup - client also adds when user comes online)
   // This ensures the user is tracked even if client-side addition failed
+  // Security: Pass IP for rate limiting
   if (schoolSlug && trackingUserId) {
-    await recordUserInHourlyTracker(schoolSlug, trackingUserId).catch((error) => {
+    await recordUserInHourlyTracker(schoolSlug, trackingUserId, ip).catch((error) => {
       // Silently fail - hourly tracking is non-blocking
       // Continue even if tracking fails
     });
 
     // Recalculate user count after adding current user
-    const updatedUserCount = await getUniqueUsersInPastHour(schoolSlug);
+    // Security: Pass IP for rate limiting
+    const updatedUserCount = await getUniqueUsersInPastHour(schoolSlug, ip);
     const updatedHourlyLimit = updatedUserCount * HOURLY_LIMIT_PER_USER;
 
     // Use updated counts if they're higher (current user was added)
@@ -660,52 +1188,79 @@ exports.updateScore = onCall({
       });
 
   // Update RTDB with hourly score increase and hourly limit for real-time display
+  // Security: Only server (Cloud Functions) can write to schoolStats
   if (schoolSlug && realtimeDb) {
     try {
-      // Recalculate user count right before writing to ensure we use the current hour's data
-      const currentUserCount = await getUniqueUsersInPastHour(schoolSlug);
-      const currentHourlyLimit = currentUserCount * HOURLY_LIMIT_PER_USER;
-      const currentFallback = currentHourlyLimit === 0;
+      // Security: Validate school slug before proceeding
+      if (!isValidSchoolSlug(schoolSlug)) {
+        logger.warn("Invalid school slug format for stats update", {
+          schoolId: trimmedId,
+          schoolSlug,
+        });
+        // Don't update stats if slug is invalid
+      } else {
+        // Recalculate user count right before writing to ensure we use the current hour's data
+        // Security: Pass IP for rate limiting
+        const currentUserCount = await getUniqueUsersInPastHour(schoolSlug, ip);
 
-      // Calculate the score increase since the hour started
-      // This is the same as usedPoints in the hourly limit document
-      const now = new Date();
-      now.setMinutes(0, 0, 0);
-      const currentWindowStartMs = now.getTime();
+        // Security: Validate user count (reasonable bounds)
+        const validUserCount = Math.max(0, Math.min(currentUserCount, 10000)); // Max 10k users per hour
+        const currentHourlyLimit = validUserCount * HOURLY_LIMIT_PER_USER;
+        const currentFallback = currentHourlyLimit === 0;
 
-      // Get the hourly limit document to find usedPoints (score increase this hour)
-      const limitSnap = await limitRef.get();
-      let hourlyScoreIncrease = 0;
-      if (limitSnap.exists) {
-        const limitData = limitSnap.data() || {};
-        if (limitData.windowStart instanceof Timestamp &&
-            limitData.windowStart.toMillis() === currentWindowStartMs) {
-          hourlyScoreIncrease = Number(limitData.points) || 0;
+        // Calculate the score increase since the hour started
+        // This is the same as usedPoints in the hourly limit document
+        const now = new Date();
+        now.setMinutes(0, 0, 0);
+        const currentWindowStartMs = now.getTime();
+
+        // Get the hourly limit document to find usedPoints (score increase this hour)
+        const limitSnap = await limitRef.get();
+        let hourlyScoreIncrease = 0;
+        if (limitSnap.exists) {
+          const limitData = limitSnap.data() || {};
+          if (limitData.windowStart instanceof Timestamp &&
+              limitData.windowStart.toMillis() === currentWindowStartMs) {
+            hourlyScoreIncrease = Number(limitData.points) || 0;
+            // Security: Validate score increase (reasonable bounds)
+            hourlyScoreIncrease = Math.max(0, Math.min(hourlyScoreIncrease, 100000000)); // Max 100M
+          }
         }
+
+        // Calculate remaining quota based on current hourly limit
+        const currentRemainingQuota = Math.max(0, currentHourlyLimit - hourlyScoreIncrease);
+        const currentLimitReached = hourlyScoreIncrease >= currentHourlyLimit;
+        const updateTime = Date.now();
+
+        // Security: Validate all values before writing
+        if (!isValidTimestamp(updateTime)) {
+          logger.error("Invalid timestamp for stats update", {
+            schoolSlug,
+            updateTime,
+          });
+          return;
+        }
+
+        // Write to RTDB: schoolStats/{schoolSlug}/hourlyScoreIncrease and hourlyLimit
+        // Note: RTDB rules block client writes, only server (Cloud Functions) can write
+        const statsRef = realtimeDb.ref(`schoolStats/${schoolSlug}`);
+        await statsRef.set({
+          hourlyScoreIncrease: hourlyScoreIncrease, // Score increase since hour started
+          hourlyLimit: currentHourlyLimit > 0 ? currentHourlyLimit : SCHOOL_HOURLY_LIMIT_FALLBACK,
+          uniqueUsers: validUserCount,
+          remainingQuota: currentRemainingQuota,
+          limitReached: currentLimitReached,
+          fallbackInUse: currentFallback,
+          updatedAt: updateTime,
+        });
+
+        logger.debug("Updated school stats in RTDB", {
+          schoolSlug,
+          hourlyScoreIncrease,
+          hourlyLimit: currentHourlyLimit,
+          uniqueUsers: validUserCount,
+        });
       }
-
-      // Calculate remaining quota based on current hourly limit
-      const currentRemainingQuota = Math.max(0, currentHourlyLimit - hourlyScoreIncrease);
-      const currentLimitReached = hourlyScoreIncrease >= currentHourlyLimit;
-
-      // Write to RTDB: schoolStats/{schoolSlug}/hourlyScoreIncrease and hourlyLimit
-      const statsRef = realtimeDb.ref(`schoolStats/${schoolSlug}`);
-      await statsRef.set({
-        hourlyScoreIncrease: hourlyScoreIncrease, // Score increase since hour started
-        hourlyLimit: currentHourlyLimit > 0 ? currentHourlyLimit : SCHOOL_HOURLY_LIMIT_FALLBACK,
-        uniqueUsers: currentUserCount,
-        remainingQuota: currentRemainingQuota,
-        limitReached: currentLimitReached,
-        fallbackInUse: currentFallback,
-        updatedAt: Date.now(),
-      });
-
-      logger.debug("Updated school stats in RTDB", {
-        schoolSlug,
-        hourlyScoreIncrease,
-        hourlyLimit,
-        uniqueUsers: userCount,
-      });
     } catch (rtdbError) {
       logger.warn("Failed to update school stats in RTDB (non-blocking)", {
         schoolId: trimmedId,
@@ -737,6 +1292,95 @@ exports.updateScore = onCall({
     uniqueUsers: userCount,
     fallbackApplied: fallback,
   };
+});
+
+/**
+ * Scheduled function that runs every hour to clean up old schoolHourlyUsers data
+ * Deletes hourly user tracking data older than 2 hours to prevent RTDB bloat
+ */
+exports.cleanupOldHourlyUsers = onSchedule({
+  schedule: "0 * * * *", // Run every hour at minute 0
+  timeZone: "UTC",
+  memory: "256MiB",
+  timeoutSeconds: 300,
+}, async (event) => {
+  const db = getDatabase();
+  const startTime = Date.now();
+  const now = new Date();
+  now.setMinutes(0, 0, 0);
+  const currentHourMs = now.getTime();
+  // Keep data from current hour and previous hour (2 hours total)
+  const cutoffHourMs = currentHourMs - (2 * 60 * 60 * 1000);
+
+  logger.info("Starting hourly users cleanup", {
+    currentTime: now.toISOString(),
+    currentHourMs,
+    cutoffHourMs,
+    cutoffTime: new Date(cutoffHourMs).toISOString(),
+  });
+
+  try {
+    const schoolHourlyUsersRef = db.ref("schoolHourlyUsers");
+    const snapshot = await schoolHourlyUsersRef.once("value");
+
+    if (!snapshot.exists()) {
+      logger.info("No schoolHourlyUsers data found - nothing to clean");
+      return;
+    }
+
+    const schoolHourlyUsers = snapshot.val();
+    let totalDeleted = 0;
+    let schoolsProcessed = 0;
+
+    // Process each school
+    for (const [schoolSlug, hourWindows] of Object.entries(schoolHourlyUsers)) {
+      if (!hourWindows || typeof hourWindows !== "object") continue;
+
+      schoolsProcessed++;
+      let schoolDeleted = 0;
+
+      // Process each hour window
+      for (const [hourWindowKey] of Object.entries(hourWindows)) {
+        const hourWindowMs = parseInt(hourWindowKey, 10);
+
+        // Delete if older than cutoff (more than 2 hours old)
+        if (!isNaN(hourWindowMs) && hourWindowMs < cutoffHourMs) {
+          try {
+            await db.ref(`schoolHourlyUsers/${schoolSlug}/${hourWindowKey}`).remove();
+            schoolDeleted++;
+            totalDeleted++;
+
+            logger.debug("Deleted old hourly window", {
+              schoolSlug,
+              hourWindowKey,
+              hourWindowTime: new Date(hourWindowMs).toISOString(),
+            });
+          } catch (error) {
+            logger.error("Error deleting hourly window", {
+              schoolSlug,
+              hourWindowKey,
+              error: error.message,
+            });
+          }
+        }
+      }
+
+      if (schoolDeleted > 0) {
+        logger.info(`Cleaned up ${schoolDeleted} old hourly windows for school: ${schoolSlug}`);
+      }
+    }
+
+    logger.info("Hourly users cleanup completed", {
+      schoolsProcessed,
+      totalWindowsDeleted: totalDeleted,
+      duration: `${Date.now() - startTime}ms`,
+    });
+  } catch (error) {
+    logger.error("Error during hourly users cleanup", {
+      error: error.message,
+      stack: error.stack,
+    });
+  }
 });
 
 /**

@@ -3,14 +3,20 @@
     "schoolOnlineUsers": {
       "$schoolSlug": {
         ".read": true,
-        ".write": true
+        // Only allow writes from server (Cloud Functions)
+        // Client-side writes are blocked - only server can update online users
+        // This prevents abuse and ensures all writes go through rate limiting and validation
+        ".write": false
       }
     },
     "schoolHourlyUsers": {
       "$schoolSlug": {
         "$hourWindow": {
           ".read": true,
-          ".write": true
+          // Only allow writes from server (Cloud Functions)
+          // Client-side writes are blocked - only server can update hourly users
+          // This prevents abuse and ensures all writes go through rate limiting and validation
+          ".write": false
         }
       }
     },
@@ -18,13 +24,18 @@
       "$schoolSlug": {
         ".read": true,
         ".write": true,
-        ".indexOn": "timestamp"
+        ".indexOn": "timestamp",
+        "$messageId": {
+          ".validate": "newData.hasChildren(['message', 'timestamp', 'userId']) && newData.child('message').isString() && newData.child('timestamp').isNumber()"
+        }
       }
     },
     "schoolStats": {
       "$schoolSlug": {
         ".read": true,
-        ".write": true
+        // Only allow writes from server (Cloud Functions)
+        // Client-side writes are blocked - only server can update stats
+        ".write": false
       }
     }
   }

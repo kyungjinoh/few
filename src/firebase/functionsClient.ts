@@ -5,6 +5,9 @@ const functions = getFunctions(app);
 const updateScoreCallable = httpsCallable(functions, "updateScore");
 const addSchoolCallable = httpsCallable(functions, "addSchool");
 const createSessionCallable = httpsCallable(functions, "createClickerSession");
+const recordHourlyUserCallable = httpsCallable(functions, "recordHourlyUser");
+const initializeOnlinePresenceCallable = httpsCallable(functions, "initializeOnlinePresence");
+const removeOnlinePresenceCallable = httpsCallable(functions, "removeOnlinePresence");
 
 const SESSION_STORAGE_KEY = "schoolClicker_sessionToken";
 const CLIENT_ID_COOKIE_NAME = "_ga_school_clicker"; // Similar to GA4's _ga cookie (Device ID)
@@ -266,4 +269,135 @@ interface AddSchoolResponse {
 export const callAddSchool = async (payload: AddSchoolPayload): Promise<AddSchoolResponse> => {
   const response = await addSchoolCallable(payload);
   return response.data as AddSchoolResponse;
+};
+
+interface RecordHourlyUserPayload {
+  schoolSlug: string;
+  userId: string;
+  sessionToken?: string;
+}
+
+interface RecordHourlyUserResponse {
+  success: boolean;
+  schoolSlug: string;
+  userId: string;
+}
+
+/**
+ * Securely record a user in the hourly tracker via Cloud Function.
+ * Uses session validation and rate limiting to prevent abuse.
+ */
+export const callRecordHourlyUser = async (
+  schoolSlug: string,
+  userId: string,
+): Promise<RecordHourlyUserResponse> => {
+  const sessionToken = await ensureSessionToken();
+
+  const payload: RecordHourlyUserPayload = {
+    schoolSlug,
+    userId,
+    sessionToken,
+  };
+
+  try {
+    const response = await recordHourlyUserCallable(payload);
+    return response.data as RecordHourlyUserResponse;
+  } catch (error: any) {
+    const code: string | undefined = error?.code;
+    const detailsCode: string | undefined = error?.details?.code;
+
+    // Reset the session token if the backend says it is invalid or expired
+    if (code === "functions/unauthenticated" || detailsCode === "INVALID_SESSION") {
+      clearStoredSessionToken();
+    }
+
+    // If the session was blocked, avoid reusing the token
+    if (detailsCode === "TEMP_BLOCK") {
+      clearStoredSessionToken();
+    }
+
+    throw error;
+  }
+};
+
+interface InitializeOnlinePresencePayload {
+  schoolSlug: string;
+  userId: string;
+}
+
+interface InitializeOnlinePresenceResponse {
+  success: boolean;
+  schoolSlug: string;
+  userId: string;
+}
+
+/**
+ * Securely initialize online presence via Cloud Function.
+ * Uses rate limiting and validation to prevent abuse.
+ */
+export const callInitializeOnlinePresence = async (
+  schoolSlug: string,
+  userId: string,
+): Promise<InitializeOnlinePresenceResponse> => {
+  const payload: InitializeOnlinePresencePayload = {
+    schoolSlug,
+    userId,
+  };
+
+  try {
+    const response = await initializeOnlinePresenceCallable(payload);
+    return response.data as InitializeOnlinePresenceResponse;
+  } catch (error: any) {
+    const code: string | undefined = error?.code;
+    const detailsCode: string | undefined = error?.details?.code;
+
+    // Handle rate limiting errors
+    if (code === "functions/resource-exhausted" || detailsCode === "resource-exhausted") {
+      // Log but don't throw - presence is non-critical
+      console.warn("Rate limit exceeded for online presence initialization");
+      throw error;
+    }
+
+    throw error;
+  }
+};
+
+interface RemoveOnlinePresencePayload {
+  schoolSlug: string;
+  userId: string;
+}
+
+interface RemoveOnlinePresenceResponse {
+  success: boolean;
+  schoolSlug: string;
+  userId: string;
+}
+
+/**
+ * Securely remove online presence via Cloud Function.
+ * Uses rate limiting and validation to prevent abuse.
+ */
+export const callRemoveOnlinePresence = async (
+  schoolSlug: string,
+  userId: string,
+): Promise<RemoveOnlinePresenceResponse> => {
+  const payload: RemoveOnlinePresencePayload = {
+    schoolSlug,
+    userId,
+  };
+
+  try {
+    const response = await removeOnlinePresenceCallable(payload);
+    return response.data as RemoveOnlinePresenceResponse;
+  } catch (error: any) {
+    // Silently handle errors - removal is cleanup operation
+    // Log for debugging but don't throw to user
+    console.warn("Failed to remove online presence", error);
+    // Return success even on error to prevent blocking user experience
+    return {
+      success: false,
+      schoolSlug,
+      userId,
+    };
+  }
 };

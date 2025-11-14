@@ -1,5 +1,6 @@
 import { realtimeDb } from './config';
-import { ref, onValue, onDisconnect, serverTimestamp, remove, set, get } from 'firebase/database';
+import { ref, onValue } from 'firebase/database';
+import { callRecordHourlyUser, callInitializeOnlinePresence, callRemoveOnlinePresence } from './functionsClient';
 
 export interface OnlineUsersData {
   totalOnline: number;
@@ -37,7 +38,7 @@ class OnlinePresenceService {
    */
   async initializePresence(schoolSlug: string): Promise<void> {
     try {
-      // Check if Realtime Database is available
+      // Check if Realtime Database is available (for reads/subscriptions)
       if (!realtimeDb) {
         console.warn('⚠️ Realtime Database not initialized - online presence disabled');
         return;
@@ -56,52 +57,48 @@ class OnlinePresenceService {
       this.currentSchool = schoolSlug;
       const userId = this.getUserId();
       
-      // Use the consistent user ID instead of auto-generated push ID
-      this.userRef = ref(realtimeDb, `schoolOnlineUsers/${schoolSlug}/${userId}`);
-      
-      // Check if push was successful
-      if (!this.userRef) {
-        throw new Error('Failed to create user reference - check database connection');
+      // Use secure Cloud Function instead of direct RTDB write to prevent abuse
+      // This ensures all writes go through rate limiting and validation
+      try {
+        await callInitializeOnlinePresence(schoolSlug, userId);
+      } catch (error: any) {
+        // Log error but continue - presence is non-critical
+        // Check if it's a rate limit error (expected) vs other errors
+        const errorCode = error?.code || error?.details?.code;
+        if (errorCode === 'functions/resource-exhausted' || errorCode === 'resource-exhausted') {
+          // Rate limit exceeded - this is expected and non-critical
+          console.debug('Rate limit reached for online presence (non-critical)');
+        } else {
+          // Other errors - log for debugging
+          console.warn('⚠️ Failed to initialize online presence via Cloud Function', {
+            error: error?.message || error,
+            code: errorCode,
+          });
+        }
+        // Still set userRef for cleanup even if initialization failed
       }
-      
-      // Set the user as online on this specific school
-      await set(this.userRef, {
-        timestamp: serverTimestamp(),
-        online: true,
-        school: schoolSlug
-      });
+
+      // Create reference for reading/disconnect tracking (client can still read)
+      this.userRef = ref(realtimeDb, `schoolOnlineUsers/${schoolSlug}/${userId}`);
 
       // Also add user to hourly cumulative tracker (schoolHourlyUsers)
       // This cumulates all users who were online at any point in the current hour
       // The hourly tracker persists even when user disconnects (unlike schoolOnlineUsers)
+      // Use secure Cloud Function instead of direct RTDB write to prevent abuse
       try {
-        const now = new Date();
-        now.setMinutes(0, 0, 0);
-        const hourWindowKey = now.getTime().toString();
-        const hourlyUserRef = ref(realtimeDb, `schoolHourlyUsers/${schoolSlug}/${hourWindowKey}/${userId}`);
-
-        // Check if user already exists in hourly tracker to preserve firstSeen
-        const existingSnapshot = await get(hourlyUserRef);
-        const existingData = existingSnapshot.val();
-        const firstSeen = existingData && existingData.firstSeen ? existingData.firstSeen : serverTimestamp();
-
-        // Add to hourly tracker (cumulative - doesn't remove on disconnect)
-        // Preserve firstSeen timestamp if user already exists
-        await set(hourlyUserRef, {
-          timestamp: serverTimestamp(),
-          firstSeen: firstSeen
-        });
+        await callRecordHourlyUser(schoolSlug, userId);
       } catch (hourlyError) {
         // Silently fail - hourly tracking is secondary to online presence
         // Don't log to reduce console noise
+        // The server-side backup in updateScore will still record the user
       }
 
-      // Remove the user when they disconnect (only from schoolOnlineUsers, not hourly tracker)
-      await onDisconnect(this.userRef).remove();
+      // Note: onDisconnect is no longer needed since removal is handled by Cloud Function
+      // But we keep userRef for tracking purposes
 
     } catch (error) {
       console.error('❌ Error initializing presence:', error);
-      console.warn('💡 Make sure Firebase Realtime Database is enabled in Firebase Console');
+      console.warn('💡 Make sure Firebase Cloud Functions are enabled and deployed');
     }
   }
 
@@ -109,14 +106,23 @@ class OnlinePresenceService {
    * Remove presence tracking when user leaves
    */
   async removePresence(): Promise<void> {
-    if (this.userRef && this.currentSchool) {
+    if (this.currentSchool) {
+      const userId = this.getUserId();
       try {
-        await remove(this.userRef);
-        this.userRef = null;
-        this.currentSchool = null;
-      } catch (error) {
-        console.error('❌ Error removing presence:', error);
-        // Force cleanup even if removal failed
+        // Use secure Cloud Function instead of direct RTDB write to prevent abuse
+        await callRemoveOnlinePresence(this.currentSchool, userId);
+      } catch (error: any) {
+        // Silently handle - removal is cleanup operation
+        // Only log non-rate-limit errors
+        const errorCode = error?.code || error?.details?.code;
+        if (errorCode !== 'functions/resource-exhausted' && errorCode !== 'resource-exhausted') {
+          console.debug('Failed to remove online presence (cleanup operation)', {
+            error: error?.message || error,
+            code: errorCode,
+          });
+        }
+      } finally {
+        // Always cleanup local state
         this.userRef = null;
         this.currentSchool = null;
       }
