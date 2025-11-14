@@ -16,7 +16,8 @@
   "dependencies": {
     "firebase-admin": "^12.6.0",
     "firebase-functions": "^6.0.1",
-    "rate-limiter-flexible": "^8.1.0"
+    "rate-limiter-flexible": "^8.1.0",
+    "school-clicker": "file:.."
   },
   "devDependencies": {
     "eslint": "^8.15.0",

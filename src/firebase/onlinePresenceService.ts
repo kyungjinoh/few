@@ -1,5 +1,5 @@
 import { realtimeDb } from './config';
-import { ref, onValue, push, onDisconnect, serverTimestamp, remove, set } from 'firebase/database';
+import { ref, onValue, onDisconnect, serverTimestamp, remove, set, get } from 'firebase/database';
 
 export interface OnlineUsersData {
   totalOnline: number;
@@ -55,7 +55,6 @@ class OnlinePresenceService {
 
       this.currentSchool = schoolSlug;
       const userId = this.getUserId();
-      const schoolUsersRef = ref(realtimeDb, `schoolOnlineUsers/${schoolSlug}`);
       
       // Use the consistent user ID instead of auto-generated push ID
       this.userRef = ref(realtimeDb, `schoolOnlineUsers/${schoolSlug}/${userId}`);
@@ -72,7 +71,32 @@ class OnlinePresenceService {
         school: schoolSlug
       });
 
-      // Remove the user when they disconnect
+      // Also add user to hourly cumulative tracker (schoolHourlyUsers)
+      // This cumulates all users who were online at any point in the current hour
+      // The hourly tracker persists even when user disconnects (unlike schoolOnlineUsers)
+      try {
+        const now = new Date();
+        now.setMinutes(0, 0, 0);
+        const hourWindowKey = now.getTime().toString();
+        const hourlyUserRef = ref(realtimeDb, `schoolHourlyUsers/${schoolSlug}/${hourWindowKey}/${userId}`);
+
+        // Check if user already exists in hourly tracker to preserve firstSeen
+        const existingSnapshot = await get(hourlyUserRef);
+        const existingData = existingSnapshot.val();
+        const firstSeen = existingData && existingData.firstSeen ? existingData.firstSeen : serverTimestamp();
+
+        // Add to hourly tracker (cumulative - doesn't remove on disconnect)
+        // Preserve firstSeen timestamp if user already exists
+        await set(hourlyUserRef, {
+          timestamp: serverTimestamp(),
+          firstSeen: firstSeen
+        });
+      } catch (hourlyError) {
+        // Silently fail - hourly tracking is secondary to online presence
+        // Don't log to reduce console noise
+      }
+
+      // Remove the user when they disconnect (only from schoolOnlineUsers, not hourly tracker)
       await onDisconnect(this.userRef).remove();
 
     } catch (error) {

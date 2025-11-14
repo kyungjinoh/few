@@ -17,6 +17,7 @@ module.exports = {
     "quotes": ["error", "double", {"allowTemplateLiterals": true}],
     "max-len": ["error", {"code": 120}], // Allow longer lines for Firebase functions
     "require-jsdoc": "off", // Disable JSDoc requirement for Firebase functions
+    "linebreak-style": "off",
   },
   overrides: [
     {

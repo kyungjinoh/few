@@ -7,8 +7,121 @@ const addSchoolCallable = httpsCallable(functions, "addSchool");
 const createSessionCallable = httpsCallable(functions, "createClickerSession");
 
 const SESSION_STORAGE_KEY = "schoolClicker_sessionToken";
+const CLIENT_ID_COOKIE_NAME = "_ga_school_clicker"; // Similar to GA4's _ga cookie (Device ID)
+const CLIENT_ID_COOKIE_EXPIRY_DAYS = 730; // 2 years, same as GA4
+const USER_ID_STORAGE_KEY = "schoolClicker_userId"; // User-ID (persistent user identifier)
 
 let pendingSessionPromise: Promise<string> | null = null;
+
+/**
+ * Get or set a cookie value.
+ * @param name Cookie name
+ * @param value Cookie value
+ * @param days Days until expiration
+ */
+const setCookie = (name: string, value: string, days: number): void => {
+  if (typeof document === "undefined") return;
+
+  const expires = new Date();
+  expires.setTime(expires.getTime() + days * 24 * 60 * 60 * 1000);
+  document.cookie = `${name}=${value};expires=${expires.toUTCString()};path=/;SameSite=Lax`;
+};
+
+/**
+ * Get a cookie value by name.
+ * @param name Cookie name
+ * @returns Cookie value or null
+ */
+const getCookie = (name: string): string | null => {
+  if (typeof document === "undefined") return null;
+
+  const nameEQ = name + "=";
+  const cookies = document.cookie.split(";");
+  for (let i = 0; i < cookies.length; i++) {
+    let cookie = cookies[i];
+    while (cookie.charAt(0) === " ") {
+      cookie = cookie.substring(1, cookie.length);
+    }
+    if (cookie.indexOf(nameEQ) === 0) {
+      return cookie.substring(nameEQ.length, cookie.length);
+    }
+  }
+  return null;
+};
+
+/**
+ * Generate a GA4-style Client ID.
+ * Format: {timestamp}.{random} (same format as GA4's _ga cookie)
+ * @returns Client ID string
+ */
+const generateClientId = (): string => {
+  const timestamp = Math.floor(Date.now() / 1000); // Unix timestamp in seconds
+  const random = Math.floor(Math.random() * 2147483647); // Random number (max 32-bit int)
+  return `${timestamp}.${random}`;
+};
+
+/**
+ * Get or create a GA4-style Client ID from cookie.
+ * This mimics GA4's _ga cookie behavior - persists across sessions for 2 years.
+ * This is the Device ID (client_id / app_instance_id) that identifies the device/browser.
+ * @returns Client ID string in GA4 format (timestamp.random)
+ */
+const getClientId = (): string => {
+  if (typeof window === "undefined") {
+    return "unknown";
+  }
+
+  try {
+    // Try to get existing Client ID from cookie (like GA4's _ga cookie)
+    let clientId = getCookie(CLIENT_ID_COOKIE_NAME);
+
+    if (!clientId) {
+      // Generate a new GA4-style Client ID
+      clientId = generateClientId();
+      // Store in cookie with 2-year expiration (same as GA4)
+      setCookie(CLIENT_ID_COOKIE_NAME, clientId, CLIENT_ID_COOKIE_EXPIRY_DAYS);
+    }
+
+    return clientId;
+  } catch (error) {
+    console.warn("Unable to read/write Client ID cookie", error);
+    // Fallback: try localStorage if cookies are blocked
+    try {
+      const fallbackId = localStorage.getItem(CLIENT_ID_COOKIE_NAME);
+      if (fallbackId) return fallbackId;
+      const newId = generateClientId();
+      localStorage.setItem(CLIENT_ID_COOKIE_NAME, newId);
+      return newId;
+    } catch (e) {
+      return "unknown";
+    }
+  }
+};
+
+/**
+ * Get or create a User-ID from localStorage.
+ * This is a persistent user identifier (like GA4's User-ID).
+ * Prefer User-ID over Client ID for unique user counting when available.
+ * @returns User-ID string or null if unavailable
+ */
+const getUserId = (): string | null => {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    let userId = localStorage.getItem(USER_ID_STORAGE_KEY);
+    if (!userId) {
+      // Generate a new unique user ID
+      userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      localStorage.setItem(USER_ID_STORAGE_KEY, userId);
+    }
+    return userId;
+  } catch (error) {
+    console.warn("Unable to read/write User-ID from storage", error);
+    return null;
+  }
+};
 
 const getStoredSessionToken = (): string | null => {
   if (typeof window === "undefined") {
@@ -96,11 +209,15 @@ export const callUpdateScore = async (
   options: UpdateScoreOptions = {},
 ): Promise<void> => {
   const sessionToken = await ensureSessionToken();
+  const clientId = getClientId(); // Device ID (GA4 Client ID / app_instance_id)
+  const userId = getUserId(); // User-ID (persistent user identifier)
 
   const payload: Record<string, unknown> = {
     schoolId,
     delta,
     sessionToken,
+    clientId, // Device ID (GA4 Client ID - identifies device/browser)
+    userId, // User-ID (identifies the user - prefer this for unique counting)
     clientContext: {
       userAgent: options.userAgentOverride ?? (typeof navigator !== "undefined" ? navigator.userAgent : undefined),
     },
