@@ -20,49 +20,16 @@ initializeApp();
 setGlobalOptions({maxInstances: 10});
 
 const firestore = getFirestore();
-const rateLimiter = new RateLimiterMemory({
-  points: 5,
-  duration: 60,
-});
-
-const addSchoolRateLimiter = new RateLimiterMemory({
-  points: 3,
-  duration: 60 * 60, // 3 attempts per hour per IP
-});
-
-// Rate limiter for hourly user tracking writes (per IP)
-const hourlyUserTrackingRateLimiter = new RateLimiterMemory({
-  points: 100, // 100 writes per hour per IP
-  duration: 60 * 60,
-});
-
-// Rate limiter for stats reads (per IP) - prevent abuse
-const statsReadRateLimiter = new RateLimiterMemory({
-  points: 1000, // 1000 reads per hour per IP
-  duration: 60 * 60,
-});
-
-// Strict rate limiter for recordHourlyUser callable function (per IP)
-// Much stricter than updateScore to prevent fake user spam
-const recordHourlyUserRateLimiter = new RateLimiterMemory({
-  points: 20, // Only 20 calls per hour per IP (very strict)
-  duration: 60 * 60,
-});
 
 // Per-user-ID rate limiter to prevent same user from being added multiple times
-// Tracked by userId + schoolSlug combination
+// Tracked by userId + schoolSlug combination (NOT IP-based)
 const userHourlyRecordRateLimiter = new RateLimiterMemory({
   points: 5, // Maximum 5 records per hour per user per school
   duration: 60 * 60,
 });
 
-// Rate limiter for initializeOnlinePresence callable function (per IP)
-const initializeOnlinePresenceRateLimiter = new RateLimiterMemory({
-  points: 30, // 30 presence initializations per hour per IP
-  duration: 60 * 60,
-});
-
 // Per-user presence rate limiter (prevent spam of presence updates)
+// NOT IP-based - tracks by userId + schoolSlug combination
 const userPresenceRateLimiter = new RateLimiterMemory({
   points: 10, // Maximum 10 presence updates per hour per user per school
   duration: 60 * 60,
@@ -116,6 +83,111 @@ const isValidTimestamp = (timestamp) => {
   const oneDayAgo = now - (24 * 60 * 60 * 1000);
   const oneDayFromNow = now + (60 * 60 * 1000); // Allow 1 hour in future for clock skew
   return timestamp >= oneDayAgo && timestamp <= oneDayFromNow;
+};
+
+/**
+ * Validate request size (prevent DoS attacks)
+ * @param {object} data - Request data
+ * @param {number} maxSize - Maximum size in bytes (default: 10KB)
+ * @return {boolean} True if valid
+ */
+const validateRequestSize = (data, maxSize = 10240) => {
+  try {
+    const jsonString = JSON.stringify(data);
+    return jsonString.length <= maxSize;
+  } catch (error) {
+    return false;
+  }
+};
+
+/**
+ * Detect suspicious patterns in requests (abuse detection)
+ * @param {string} ip - IP address
+ * @param {string} userId - User ID
+ * @param {string} schoolSlug - School slug
+ * @return {Promise<{isSuspicious: boolean, reason: string}>}
+ */
+const detectSuspiciousActivity = async (ip, userId, schoolSlug) => {
+  try {
+    // Check for rapid requests from same IP with different user IDs (bot detection)
+    // This is a simplified check - in production, use Cloud Security Command Center
+    const suspiciousPatterns = [];
+
+    // Pattern 1: User ID doesn't match expected format (potential injection)
+    if (userId && !isValidUserId(userId)) {
+      suspiciousPatterns.push("Invalid user ID format");
+    }
+
+    // Pattern 2: School slug doesn't match expected format
+    if (schoolSlug && !isValidSchoolSlug(schoolSlug)) {
+      suspiciousPatterns.push("Invalid school slug format");
+    }
+
+    // Pattern 3: Very long user IDs (potential buffer overflow attempt)
+    if (userId && userId.length > 100) {
+      suspiciousPatterns.push("User ID too long");
+    }
+
+    // Pattern 4: IP address patterns (check for known bad IPs)
+    // In production, integrate with Google Cloud Armor or Cloud Security Command Center
+    if (ip === "unknown" || !ip || ip.length > 45) {
+      suspiciousPatterns.push("Invalid IP address");
+    }
+
+    if (suspiciousPatterns.length > 0) {
+      logger.warn("Suspicious activity detected", {
+        ip,
+        userId,
+        schoolSlug,
+        patterns: suspiciousPatterns,
+      });
+      return {
+        isSuspicious: true,
+        reason: suspiciousPatterns.join(", "),
+      };
+    }
+
+    return {
+      isSuspicious: false,
+      reason: "",
+    };
+  } catch (error) {
+    logger.error("Error detecting suspicious activity", {
+      error: error.message,
+      ip,
+      userId,
+      schoolSlug,
+    });
+    // On error, assume not suspicious to avoid blocking legitimate users
+    return {
+      isSuspicious: false,
+      reason: "",
+    };
+  }
+};
+
+/**
+ * Log security event for audit trail
+ * @param {string} eventType - Type of security event
+ * @param {object} eventData - Event data
+ * @return {Promise<void>}
+ */
+const logSecurityEvent = async (eventType, eventData) => {
+  try {
+    // Log to Firestore for audit trail
+    await firestore.collection("securityEvents").add({
+      eventType,
+      ...eventData,
+      timestamp: FieldValue.serverTimestamp(),
+      severity: eventData.severity || "info",
+    });
+  } catch (error) {
+    // Don't throw - logging failures shouldn't block operations
+    logger.error("Failed to log security event", {
+      eventType,
+      error: error.message,
+    });
+  }
 };
 
 const GA4_MEASUREMENT_ID = process.env.GA4_MEASUREMENT_ID;
@@ -227,11 +299,10 @@ const verifyUserExistsOnline = async (schoolSlug, userId) => {
  * Now requires user to exist in schoolOnlineUsers first.
  * @param {string} schoolSlug - School slug (URL-friendly name)
  * @param {string} userId - User-ID (from schoolOnlineUsers)
- * @param {string} ip - IP address for rate limiting
  * @param {boolean} skipVerification - Skip online verification (only for server-side backup)
  * @return {Promise<void>}
  */
-const recordUserInHourlyTracker = async (schoolSlug, userId, ip = null, skipVerification = false) => {
+const recordUserInHourlyTracker = async (schoolSlug, userId, skipVerification = false) => {
   try {
     if (!realtimeDb) {
       logger.warn("Realtime Database not available for hourly tracking");
@@ -275,27 +346,12 @@ const recordUserInHourlyTracker = async (schoolSlug, userId, ip = null, skipVeri
         logger.warn("Attempted to record user who is not online", {
           schoolSlug,
           userId,
-          ip,
         });
         // Reject fake users
         return;
       }
     }
 
-    // Security: Rate limiting (if IP provided)
-    if (ip) {
-      try {
-        await hourlyUserTrackingRateLimiter.consume(ip);
-      } catch (rateLimitError) {
-        logger.warn("Rate limit exceeded for hourly user tracking", {
-          ip,
-          schoolSlug,
-          userId,
-        });
-        // Don't throw - silently fail to prevent blocking
-        return;
-      }
-    }
 
     const hourWindowStart = getCurrentHourWindow();
     const hourWindowKey = hourWindowStart.toMillis().toString();
@@ -356,10 +412,9 @@ const recordUserInHourlyTracker = async (schoolSlug, userId, ip = null, skipVeri
  * Uses RTDB: reads from schoolHourlyUsers which cumulates users from schoolOnlineUsers.
  * Includes security validation.
  * @param {string} schoolSlug - School slug (URL-friendly name)
- * @param {string} ip - IP address for rate limiting (optional)
  * @return {Promise<number>} Number of unique users in the current hour
  */
-const getUniqueUsersInPastHour = async (schoolSlug, ip = null) => {
+const getUniqueUsersInPastHour = async (schoolSlug) => {
   try {
     if (!realtimeDb) {
       logger.warn("Realtime Database not available for user count");
@@ -374,19 +429,6 @@ const getUniqueUsersInPastHour = async (schoolSlug, ip = null) => {
       return 0;
     }
 
-    // Security: Rate limiting for stats reads (if IP provided)
-    if (ip) {
-      try {
-        await statsReadRateLimiter.consume(ip);
-      } catch (rateLimitError) {
-        logger.warn("Rate limit exceeded for stats read", {
-          ip,
-          schoolSlug,
-        });
-        // Return 0 instead of throwing to prevent blocking
-        return 0;
-      }
-    }
 
     const hourWindowStart = getCurrentHourWindow();
     const hourWindowKey = hourWindowStart.toMillis().toString();
@@ -644,43 +686,81 @@ exports.createClickerSession = onCall({
 exports.recordHourlyUser = onCall({
   memory: "256MiB",
   timeoutSeconds: 10,
+  maxInstances: 10,
 }, async (request) => {
+  const startTime = Date.now();
   const data = request.data || {};
   const {schoolSlug, userId} = data;
+  const {ip, userAgent} = getRequestContext(request.rawRequest);
 
-  const {ip} = getRequestContext(request.rawRequest);
-
-  // Strict rate limiting per IP (much stricter than updateScore to prevent abuse)
-  try {
-    await recordHourlyUserRateLimiter.consume(ip);
-  } catch (error) {
-    logger.warn("IP rate limit exceeded for recordHourlyUser", {
+  // Security: Validate request size (prevent DoS)
+  if (!validateRequestSize(data, 10240)) {
+    await logSecurityEvent("request_size_exceeded", {
       ip,
-      schoolSlug,
-      userId,
-      error: error.message,
+      function: "recordHourlyUser",
+      severity: "warning",
     });
-    throw new HttpsError("resource-exhausted", "Too many requests from this IP — slow down.");
+    throw new HttpsError("invalid-argument", "Request payload too large.");
+  }
+
+  // Security: Detect suspicious activity
+  const suspicionCheck = await detectSuspiciousActivity(ip, userId, schoolSlug);
+  if (suspicionCheck.isSuspicious) {
+    await logSecurityEvent("suspicious_activity", {
+      ip,
+      userId,
+      schoolSlug,
+      reason: suspicionCheck.reason,
+      function: "recordHourlyUser",
+      severity: "warning",
+    });
+    throw new HttpsError("permission-denied", "Suspicious activity detected.");
   }
 
   // Validate inputs first
   if (typeof schoolSlug !== "string" || !schoolSlug.trim()) {
+    await logSecurityEvent("invalid_input", {
+      ip,
+      function: "recordHourlyUser",
+      field: "schoolSlug",
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Missing or invalid schoolSlug.");
   }
 
   if (typeof userId !== "string" || !userId.trim()) {
+    await logSecurityEvent("invalid_input", {
+      ip,
+      function: "recordHourlyUser",
+      field: "userId",
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Missing or invalid userId.");
   }
 
   // Validate school slug format
   const trimmedSlug = schoolSlug.trim();
   if (!isValidSchoolSlug(trimmedSlug)) {
+    await logSecurityEvent("invalid_format", {
+      ip,
+      function: "recordHourlyUser",
+      field: "schoolSlug",
+      value: trimmedSlug,
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Invalid school slug format.");
   }
 
   // Validate user ID format
   const trimmedUserId = userId.trim();
   if (!isValidUserId(trimmedUserId)) {
+    await logSecurityEvent("invalid_format", {
+      ip,
+      function: "recordHourlyUser",
+      field: "userId",
+      value: trimmedUserId,
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Invalid user ID format.");
   }
 
@@ -690,6 +770,13 @@ exports.recordHourlyUser = onCall({
   try {
     await userHourlyRecordRateLimiter.consume(userRateLimitKey);
   } catch (error) {
+    await logSecurityEvent("user_rate_limit_exceeded", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      function: "recordHourlyUser",
+      severity: "warning",
+    });
     logger.warn("User rate limit exceeded for recordHourlyUser", {
       ip,
       schoolSlug: trimmedSlug,
@@ -703,6 +790,14 @@ exports.recordHourlyUser = onCall({
   // This is the key security check that prevents fake users
   const userExists = await verifyUserExistsOnline(trimmedSlug, trimmedUserId);
   if (!userExists) {
+    await logSecurityEvent("fake_user_attempt", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      userAgent,
+      function: "recordHourlyUser",
+      severity: "error",
+    });
     logger.warn("Attempted to record fake user in hourly tracker", {
       ip,
       schoolSlug: trimmedSlug,
@@ -714,13 +809,35 @@ exports.recordHourlyUser = onCall({
   // Record user in hourly tracker (server-side write with all validations)
   // Verification is already done above, so skip it in the helper function
   try {
-    await recordUserInHourlyTracker(trimmedSlug, trimmedUserId, ip, true);
+    await recordUserInHourlyTracker(trimmedSlug, trimmedUserId, true);
+
+    // Log successful operation
+    const duration = Date.now() - startTime;
+    await logSecurityEvent("hourly_user_recorded", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      duration,
+      function: "recordHourlyUser",
+      severity: "info",
+    });
+
     return {
       success: true,
       schoolSlug: trimmedSlug,
       userId: trimmedUserId,
     };
   } catch (error) {
+    const duration = Date.now() - startTime;
+    await logSecurityEvent("operation_failed", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      error: error.message,
+      duration,
+      function: "recordHourlyUser",
+      severity: "error",
+    });
     logger.error("Failed to record hourly user via callable function", {
       schoolSlug: trimmedSlug,
       userId: trimmedUserId,
@@ -741,41 +858,81 @@ exports.recordHourlyUser = onCall({
 exports.initializeOnlinePresence = onCall({
   memory: "256MiB",
   timeoutSeconds: 10,
+  maxInstances: 10,
 }, async (request) => {
+  const startTime = Date.now();
   const data = request.data || {};
   const {schoolSlug, userId} = data;
+  const {ip, userAgent} = getRequestContext(request.rawRequest);
 
-  const {ip} = getRequestContext(request.rawRequest);
-
-  // Rate limiting per IP
-  try {
-    await initializeOnlinePresenceRateLimiter.consume(ip);
-  } catch (error) {
-    logger.warn("IP rate limit exceeded for initializeOnlinePresence", {
+  // Security: Validate request size (prevent DoS)
+  if (!validateRequestSize(data, 10240)) {
+    await logSecurityEvent("request_size_exceeded", {
       ip,
-      error: error.message,
+      function: "initializeOnlinePresence",
+      severity: "warning",
     });
-    throw new HttpsError("resource-exhausted", "Too many requests from this IP — slow down.");
+    throw new HttpsError("invalid-argument", "Request payload too large.");
+  }
+
+  // Security: Detect suspicious activity
+  const suspicionCheck = await detectSuspiciousActivity(ip, userId, schoolSlug);
+  if (suspicionCheck.isSuspicious) {
+    await logSecurityEvent("suspicious_activity", {
+      ip,
+      userId,
+      schoolSlug,
+      reason: suspicionCheck.reason,
+      function: "initializeOnlinePresence",
+      severity: "warning",
+    });
+    throw new HttpsError("permission-denied", "Suspicious activity detected.");
   }
 
   // Validate inputs
   if (typeof schoolSlug !== "string" || !schoolSlug.trim()) {
+    await logSecurityEvent("invalid_input", {
+      ip,
+      function: "initializeOnlinePresence",
+      field: "schoolSlug",
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Missing or invalid schoolSlug.");
   }
 
   if (typeof userId !== "string" || !userId.trim()) {
+    await logSecurityEvent("invalid_input", {
+      ip,
+      function: "initializeOnlinePresence",
+      field: "userId",
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Missing or invalid userId.");
   }
 
   // Validate school slug format
   const trimmedSlug = schoolSlug.trim();
   if (!isValidSchoolSlug(trimmedSlug)) {
+    await logSecurityEvent("invalid_format", {
+      ip,
+      function: "initializeOnlinePresence",
+      field: "schoolSlug",
+      value: trimmedSlug,
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Invalid school slug format.");
   }
 
   // Validate user ID format
   const trimmedUserId = userId.trim();
   if (!isValidUserId(trimmedUserId)) {
+    await logSecurityEvent("invalid_format", {
+      ip,
+      function: "initializeOnlinePresence",
+      field: "userId",
+      value: trimmedUserId,
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Invalid user ID format.");
   }
 
@@ -784,6 +941,13 @@ exports.initializeOnlinePresence = onCall({
   try {
     await userPresenceRateLimiter.consume(userPresenceKey);
   } catch (error) {
+    await logSecurityEvent("user_rate_limit_exceeded", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      function: "initializeOnlinePresence",
+      severity: "warning",
+    });
     logger.warn("User rate limit exceeded for initializeOnlinePresence", {
       ip,
       schoolSlug: trimmedSlug,
@@ -820,6 +984,18 @@ exports.initializeOnlinePresence = onCall({
       school: trimmedSlug,
     });
 
+    // Log successful operation
+    const duration = Date.now() - startTime;
+    await logSecurityEvent("online_presence_initialized", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      userAgent,
+      duration,
+      function: "initializeOnlinePresence",
+      severity: "info",
+    });
+
     logger.debug("User initialized online presence", {
       schoolSlug: trimmedSlug,
       userId: trimmedUserId,
@@ -832,6 +1008,16 @@ exports.initializeOnlinePresence = onCall({
       userId: trimmedUserId,
     };
   } catch (error) {
+    const duration = Date.now() - startTime;
+    await logSecurityEvent("operation_failed", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      error: error.message,
+      duration,
+      function: "initializeOnlinePresence",
+      severity: "error",
+    });
     logger.error("Failed to initialize online presence", {
       schoolSlug: trimmedSlug,
       userId: trimmedUserId,
@@ -856,41 +1042,81 @@ exports.initializeOnlinePresence = onCall({
 exports.removeOnlinePresence = onCall({
   memory: "256MiB",
   timeoutSeconds: 10,
+  maxInstances: 10,
 }, async (request) => {
+  const startTime = Date.now();
   const data = request.data || {};
   const {schoolSlug, userId} = data;
+  const {ip, userAgent} = getRequestContext(request.rawRequest);
 
-  const {ip} = getRequestContext(request.rawRequest);
-
-  // Rate limiting per IP (less strict for removal)
-  try {
-    await initializeOnlinePresenceRateLimiter.consume(ip);
-  } catch (error) {
-    logger.warn("IP rate limit exceeded for removeOnlinePresence", {
+  // Security: Validate request size (prevent DoS)
+  if (!validateRequestSize(data, 10240)) {
+    await logSecurityEvent("request_size_exceeded", {
       ip,
-      error: error.message,
+      function: "removeOnlinePresence",
+      severity: "warning",
     });
-    throw new HttpsError("resource-exhausted", "Too many requests from this IP — slow down.");
+    throw new HttpsError("invalid-argument", "Request payload too large.");
+  }
+
+  // Security: Detect suspicious activity
+  const suspicionCheck = await detectSuspiciousActivity(ip, userId, schoolSlug);
+  if (suspicionCheck.isSuspicious) {
+    await logSecurityEvent("suspicious_activity", {
+      ip,
+      userId,
+      schoolSlug,
+      reason: suspicionCheck.reason,
+      function: "removeOnlinePresence",
+      severity: "warning",
+    });
+    throw new HttpsError("permission-denied", "Suspicious activity detected.");
   }
 
   // Validate inputs
   if (typeof schoolSlug !== "string" || !schoolSlug.trim()) {
+    await logSecurityEvent("invalid_input", {
+      ip,
+      function: "removeOnlinePresence",
+      field: "schoolSlug",
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Missing or invalid schoolSlug.");
   }
 
   if (typeof userId !== "string" || !userId.trim()) {
+    await logSecurityEvent("invalid_input", {
+      ip,
+      function: "removeOnlinePresence",
+      field: "userId",
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Missing or invalid userId.");
   }
 
   // Validate school slug format
   const trimmedSlug = schoolSlug.trim();
   if (!isValidSchoolSlug(trimmedSlug)) {
+    await logSecurityEvent("invalid_format", {
+      ip,
+      function: "removeOnlinePresence",
+      field: "schoolSlug",
+      value: trimmedSlug,
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Invalid school slug format.");
   }
 
   // Validate user ID format
   const trimmedUserId = userId.trim();
   if (!isValidUserId(trimmedUserId)) {
+    await logSecurityEvent("invalid_format", {
+      ip,
+      function: "removeOnlinePresence",
+      field: "userId",
+      value: trimmedUserId,
+      severity: "warning",
+    });
     throw new HttpsError("invalid-argument", "Invalid user ID format.");
   }
 
@@ -906,6 +1132,18 @@ exports.removeOnlinePresence = onCall({
     // Remove user from online users
     await onlineUserRef.remove();
 
+    // Log successful operation
+    const duration = Date.now() - startTime;
+    await logSecurityEvent("online_presence_removed", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      userAgent,
+      duration,
+      function: "removeOnlinePresence",
+      severity: "info",
+    });
+
     logger.debug("User removed online presence", {
       schoolSlug: trimmedSlug,
       userId: trimmedUserId,
@@ -918,6 +1156,16 @@ exports.removeOnlinePresence = onCall({
       userId: trimmedUserId,
     };
   } catch (error) {
+    const duration = Date.now() - startTime;
+    await logSecurityEvent("operation_failed", {
+      ip,
+      schoolSlug: trimmedSlug,
+      userId: trimmedUserId,
+      error: error.message,
+      duration,
+      function: "removeOnlinePresence",
+      severity: "error",
+    });
     logger.error("Failed to remove online presence", {
       schoolSlug: trimmedSlug,
       userId: trimmedUserId,
@@ -942,23 +1190,6 @@ exports.addSchool = onCall({
 }, async (request) => {
   const data = request.data || {};
   const {schoolName, region, logoUrl, requesterEmail} = data;
-
-  let ip = "unknown";
-  if (request.rawRequest) {
-    const headers = request.rawRequest.headers || {};
-    const forwarded = headers["x-forwarded-for"];
-    if (typeof forwarded === "string" && forwarded.length > 0) {
-      ip = forwarded.split(",")[0].trim() || ip;
-    } else if (request.rawRequest.ip) {
-      ip = request.rawRequest.ip;
-    }
-  }
-
-  try {
-    await addSchoolRateLimiter.consume(ip);
-  } catch (error) {
-    throw new HttpsError("resource-exhausted", "Too many add-school requests — slow down.");
-  }
 
   if (typeof schoolName !== "string" || !schoolName.trim()) {
     throw new HttpsError("invalid-argument", "School name is required.");
@@ -1042,16 +1273,6 @@ exports.updateScore = onCall({
 
   const {ip, userAgent} = getRequestContext(request.rawRequest);
 
-  try {
-    await rateLimiter.consume(ip);
-  } catch (error) {
-    logger.warn("IP rate limit exceeded for updateScore", {
-      ip,
-      error: error.message,
-    });
-    throw new HttpsError("resource-exhausted", "Too many requests from this IP — slow down.");
-  }
-
   const trimmedId = schoolId.trim();
 
   // Extract clientId, userId, and session token from request data (sent by client)
@@ -1082,16 +1303,14 @@ exports.updateScore = onCall({
 
   // Add user to hourly tracker (backup - client also adds when user comes online)
   // This ensures the user is tracked even if client-side addition failed
-  // Security: Pass IP for rate limiting
   if (schoolSlug && trackingUserId) {
-    await recordUserInHourlyTracker(schoolSlug, trackingUserId, ip).catch((error) => {
+    await recordUserInHourlyTracker(schoolSlug, trackingUserId).catch((error) => {
       // Silently fail - hourly tracking is non-blocking
       // Continue even if tracking fails
     });
 
     // Recalculate user count after adding current user
-    // Security: Pass IP for rate limiting
-    const updatedUserCount = await getUniqueUsersInPastHour(schoolSlug, ip);
+    const updatedUserCount = await getUniqueUsersInPastHour(schoolSlug);
     const updatedHourlyLimit = updatedUserCount * HOURLY_LIMIT_PER_USER;
 
     // Use updated counts if they're higher (current user was added)
@@ -1200,8 +1419,7 @@ exports.updateScore = onCall({
         // Don't update stats if slug is invalid
       } else {
         // Recalculate user count right before writing to ensure we use the current hour's data
-        // Security: Pass IP for rate limiting
-        const currentUserCount = await getUniqueUsersInPastHour(schoolSlug, ip);
+        const currentUserCount = await getUniqueUsersInPastHour(schoolSlug);
 
         // Security: Validate user count (reasonable bounds)
         const validUserCount = Math.max(0, Math.min(currentUserCount, 10000)); // Max 10k users per hour
